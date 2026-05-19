@@ -1,0 +1,10 @@
+PySide6>=6.6
+python-mpv>=1.0
+yt-dlp>=2024.0
+numpy>=1.24
+
+# Phase 2: AI Audio Enhancement
+torch>=2.4
+audiosr>=0.0.7
+av>=12.0
+soundfile>=0.12

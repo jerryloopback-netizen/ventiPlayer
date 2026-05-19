@@ -1,0 +1,270 @@
+import sys
+import locale
+import logging
+from PySide6.QtWidgets import QWidget
+from PySide6.QtCore import Qt, Signal, Slot, QTimer, QMetaObject, Q_ARG
+import mpv
+
+logger = logging.getLogger(__name__)
+
+
+class MpvPlayerWidget(QWidget):
+    """Widget that embeds an mpv player instance for video/audio playback."""
+
+    position_changed = Signal(float)
+    duration_changed = Signal(float)
+    state_changed = Signal(str)
+    file_loaded = Signal()
+    end_of_file = Signal()
+    seek_performed = Signal(float)  # emitted after user seeks, carries target pos
+    audio_output_changed = Signal(int)  # emitted when output sample rate changes
+    audio_source_detected = Signal(int)  # emitted when source sample rate is first detected
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_DontCreateNativeAncestors)
+        self.setAttribute(Qt.WidgetAttribute.WA_NativeWindow)
+
+        self._player: mpv.MPV | None = None
+        self._duration = 0.0
+        self._position = 0.0
+        self._last_out_sr = 0
+        self._last_in_sr = 0
+
+        self._poll_timer = QTimer(self)
+        self._poll_timer.setInterval(250)
+        self._poll_timer.timeout.connect(self._poll_state)
+
+    def init_mpv(self, audio_exclusive: bool = True, audio_device: str = "auto"):
+        """Initialize mpv with the given audio settings. Must be called after widget is shown."""
+        wid = int(self.winId())
+
+        self._player = mpv.MPV(
+            wid=str(wid),
+            vo="gpu",
+            hwdec="auto-safe",
+            ao="wasapi",
+            audio_exclusive=("yes" if audio_exclusive else "no"),
+            audio_device=audio_device if audio_device != "auto" else "auto",
+            keep_open="yes",
+            idle="yes",
+            input_default_bindings=False,
+            input_vo_keyboard=False,
+            osc=False,
+            log_handler=self._mpv_log,
+            loglevel="warn",
+        )
+
+        self._poll_timer.start()
+
+    def _mpv_log(self, loglevel, component, message):
+        if loglevel in ("error", "fatal"):
+            logger.error(f"[mpv/{component}] {message}")
+        elif loglevel == "warn":
+            logger.warning(f"[mpv/{component}] {message}")
+
+    @Slot()
+    def _poll_state(self):
+        """Poll mpv state from the Qt main thread — avoids cross-thread signal issues."""
+        if not self._player:
+            return
+
+        try:
+            idle = self._player.idle_active
+            if idle:
+                if self._position != 0.0:
+                    self._position = 0.0
+                    self.state_changed.emit("stopped")
+                    self.end_of_file.emit()
+                return
+
+            duration = self._player.duration
+            if duration is not None and duration != self._duration:
+                self._duration = duration
+                self.duration_changed.emit(duration)
+                self.file_loaded.emit()
+
+            pos = self._player.time_pos
+            if pos is not None:
+                self._position = pos
+                self.position_changed.emit(pos)
+
+            paused = self._player.pause
+            if paused:
+                self.state_changed.emit("paused")
+            else:
+                self.state_changed.emit("playing")
+
+            out_params = self._player.audio_out_params
+            if out_params:
+                sr = out_params.get("samplerate", 0)
+                if sr and sr != self._last_out_sr:
+                    self._last_out_sr = sr
+                    self.audio_output_changed.emit(sr)
+
+            in_params = self._player.audio_params
+            if in_params:
+                in_sr = in_params.get("samplerate", 0)
+                if in_sr and in_sr != self._last_in_sr:
+                    self._last_in_sr = in_sr
+                    self.audio_source_detected.emit(in_sr)
+        except (RuntimeError, OSError):
+            pass
+
+    def play_url(self, url: str, http_headers: dict | None = None):
+        if self._player:
+            self._last_in_sr = 0
+            self._last_out_sr = 0
+            self._set_http_headers(http_headers)
+            self._player.play(url)
+
+    def play_av(self, video_url: str, audio_url: str, http_headers: dict | None = None):
+        """Play video with separate audio stream (for split format streams)."""
+        if self._player:
+            self._last_in_sr = 0
+            self._last_out_sr = 0
+            self._set_http_headers(http_headers)
+            self._player.audio_files = [audio_url]
+            self._player.play(video_url)
+
+    def _set_http_headers(self, headers: dict | None):
+        if not self._player:
+            return
+        if headers:
+            header_list = [f"{k}: {v}" for k, v in headers.items()]
+            self._player.http_header_fields = header_list
+        else:
+            self._player.http_header_fields = []
+
+    def pause(self):
+        if self._player:
+            self._player.pause = True
+
+    def resume(self):
+        if self._player:
+            self._player.pause = False
+
+    def toggle_pause(self):
+        if self._player:
+            self._player.pause = not self._player.pause
+
+    def stop(self):
+        if self._player:
+            self._player.stop()
+
+    def seek(self, position: float):
+        if self._player:
+            self._player.seek(position, "absolute")
+            self.seek_performed.emit(position)
+
+    def set_volume(self, volume: int):
+        if self._player:
+            self._player.volume = volume
+
+    def set_speed(self, speed: float):
+        if self._player:
+            self._player.speed = speed
+
+    @property
+    def duration(self) -> float:
+        return self._duration
+
+    @property
+    def position(self) -> float:
+        return self._position
+
+    @property
+    def is_playing(self) -> bool:
+        if self._player:
+            return not self._player.pause and not self._player.idle_active
+        return False
+
+    def set_audio_device(self, device: str):
+        if self._player:
+            self._player.audio_device = device
+
+    def get_audio_device_list(self) -> list[dict]:
+        """Return list of available audio devices from mpv."""
+        if self._player:
+            devices = self._player.audio_device_list
+            if devices:
+                return [{"name": d["name"], "description": d["description"]} for d in devices]
+        return []
+
+    def switch_audio_file(self, audio_path: str):
+        """Switch to a local audio file while keeping current video playback.
+
+        Uses audio-add with 'select' to immediately activate the new track.
+        mpv will re-open the audio output device if the sample rate differs
+        (important for WASAPI exclusive mode to output at 48kHz).
+        """
+        if self._player:
+            pos = self._position
+            self._player.command("audio-add", audio_path, "select")
+            self._last_in_sr = 0
+            self._last_out_sr = 0
+            if pos > 0.5:
+                self._player.seek(pos, "absolute")
+
+    def switch_audio_url(self, audio_url: str, http_headers: dict | None = None):
+        """Switch back to a remote audio URL (for fallback to original)."""
+        if self._player:
+            pos = self._position
+            self._set_http_headers(http_headers)
+            self._player.command("audio-add", audio_url, "select")
+            self._last_in_sr = 0
+            self._last_out_sr = 0
+            if pos > 0.5:
+                self._player.seek(pos, "absolute")
+
+    def get_audio_position(self) -> float | None:
+        """Get current audio playback position (may differ from video when using external audio)."""
+        if self._player:
+            try:
+                return self._player.audio_pts
+            except (RuntimeError, OSError, AttributeError):
+                return self._position
+        return None
+
+    def get_audio_output_params(self) -> dict | None:
+        """Get actual audio output parameters from mpv (what's being sent to the device).
+
+        Returns dict with 'samplerate', 'channel-count', 'format' or None if unavailable.
+        Uses audio-out-params which reflects the real device output after any resampling.
+        """
+        if self._player:
+            try:
+                params = self._player.audio_out_params
+                if params:
+                    return {
+                        "samplerate": params.get("samplerate"),
+                        "channel-count": params.get("channel-count"),
+                        "format": params.get("format"),
+                    }
+            except (RuntimeError, OSError, AttributeError):
+                pass
+        return None
+
+    def get_audio_input_params(self) -> dict | None:
+        """Get audio decoder output parameters (source audio format before resampling).
+
+        Returns dict with 'samplerate', 'channel-count', 'format' or None if unavailable.
+        """
+        if self._player:
+            try:
+                params = self._player.audio_params
+                if params:
+                    return {
+                        "samplerate": params.get("samplerate"),
+                        "channel-count": params.get("channel-count"),
+                        "format": params.get("format"),
+                    }
+            except (RuntimeError, OSError, AttributeError):
+                pass
+        return None
+
+    def destroy(self):
+        self._poll_timer.stop()
+        if self._player:
+            self._player.terminate()
+            self._player = None
