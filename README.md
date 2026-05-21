@@ -1,6 +1,6 @@
 # VentiPlayer
 
-> 面向音乐发烧友的 AI 音频修复流媒体播放器：输入 YouTube / Bilibili 链接，自动取最高码率音轨，经 AI 超分辨率增强后通过 WASAPI Exclusive 直通 DAC，逼近 Hi-Res 听感。
+> [unstable]面向音乐发烧友的 AI 音频修复流媒体播放器：输入 YouTube / Bilibili 链接，自动取最高码率音轨，经 AI 修复带宽及分辨率后通过 WASAPI Exclusive 直通 DAC 或数字界面。为保证画面体验加入基本滤镜和简单超分、帧生成方案。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 ![Python 3.12](https://img.shields.io/badge/Python-3.12-blue)
