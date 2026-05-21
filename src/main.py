@@ -100,7 +100,7 @@ def main():
 
     def _on_backend_ready():
         splash.close()
-        window.show()
+        window.showMaximized()
 
     window.backend_ready.connect(_on_backend_ready)
 
@@ -108,7 +108,7 @@ def main():
     def _timeout():
         if not window.isVisible():
             splash.close()
-            window.show()
+            window.showMaximized()
 
     timeout_timer = QTimer()
     timeout_timer.setSingleShot(True)

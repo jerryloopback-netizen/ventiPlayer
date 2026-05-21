@@ -19,6 +19,7 @@ class MpvPlayerWidget(QWidget):
     seek_performed = Signal(float)  # emitted after user seeks, carries target pos
     audio_output_changed = Signal(int)  # emitted when output sample rate changes
     audio_source_detected = Signal(int)  # emitted when source sample rate is first detected
+    video_output_changed = Signal(int, int, float)  # width, height, fps of actual output
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -30,6 +31,7 @@ class MpvPlayerWidget(QWidget):
         self._position = 0.0
         self._last_out_sr = 0
         self._last_in_sr = 0
+        self._last_video_out = (0, 0, 0.0)  # (w, h, fps)
 
         self._poll_timer = QTimer(self)
         self._poll_timer.setInterval(250)
@@ -108,6 +110,22 @@ class MpvPlayerWidget(QWidget):
                 if in_sr and in_sr != self._last_in_sr:
                     self._last_in_sr = in_sr
                     self.audio_source_detected.emit(in_sr)
+
+            # Video source resolution from video-out-params
+            # (GLSL shaders run on GPU and don't change this property;
+            # upscale factor is tracked separately via the enhance panel)
+            try:
+                vo_params = self._player.video_out_params
+                if vo_params:
+                    vw = vo_params.get("w", 0)
+                    vh = vo_params.get("h", 0)
+                    vfps = self._player.container_fps or 0.0
+                    current = (vw, vh, vfps)
+                    if current != self._last_video_out and vw > 0:
+                        self._last_video_out = current
+                        self.video_output_changed.emit(vw, vh, vfps)
+            except (RuntimeError, OSError, AttributeError):
+                pass
         except (RuntimeError, OSError):
             pass
 

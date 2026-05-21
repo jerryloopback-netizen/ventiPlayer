@@ -13,6 +13,8 @@
 
 - [它能做什么](#它能做什么)
 - [目前已经实现的工作](#目前已经实现的工作)
+- [浏览与播放体验](#浏览与播放体验)
+- [视频增强](#视频增强)
 - [架构总览](#架构总览)
 - [模块说明](#模块说明)
 - [部署指南](#部署指南)
@@ -48,6 +50,8 @@
 | 2 — AI 增强 | FastWave 内置实现 + AudioSR pip 包接入 + 双管道 | ✅ 完成 |
 | 3 — 同步与稳定 | SyncManager 漂移监测 / seek cooldown / fallback | ✅ 完成 |
 | 4 — GUI 完善 | 增强面板 / 状态栏 / 配置持久化 / 快捷键 | ✅ 完成 |
+| 5 — 视频增强 | CAS / Deband / Denoise / HDR / 超分辨率 (Anime4K, FSR, FSRCNNX) | ✅ 完成 |
+| 6 — 视频插帧 | mpv interpolation (video-sync + tscale) | 🔲 计划中 |
 
 实测目标硬件：
 
@@ -56,6 +60,91 @@
 - 推理后端：**Windows 原生 PyTorch 2.9 + ROCm 7.2.1**（首选，已验证）
   - DirectML / CPU 作为 fallback（代码已支持，AMD ROCm 不可用时自动选用）
 - OS：Windows 11
+
+---
+
+## 浏览与播放体验
+
+### 内容浏览
+
+右侧面板提供多标签浏览，数据来源于 Bilibili API（需 Cookie 登录态）：
+
+| 标签 | 内容 | 加载方式 |
+|---|---|---|
+| 推荐 | 个性化推荐视频 | 无限滚动，滑到底部自动加载下一页 |
+| 热门 | 全站热门排行 | 无限滚动 |
+| 搜索 | 关键词搜索结果 | 无限滚动 |
+| 收藏夹 | 用户收藏夹列表 → 文件夹内视频 | 手动刷新（需切换文件夹） |
+
+### 播放列表与历史
+
+- **播放列表**：反映当前播放上下文的来源。从搜索结果播放则列表为搜索结果；从收藏夹播放则为该文件夹内容；从推荐/热门播放则为对应列表；URL 直接解析则仅含单个视频。
+- **历史**：记录所有播放过的视频（最近优先，去重，上限 200 条），持久化到 `~/.ventiplayer/history.json`。
+- **播放模式**：控制栏单按钮循环切换——顺序 → 单曲循环 → 列表循环 → 随机。
+
+### 缩略图
+
+- 可在设置中开启缩略图模式，所有视频列表（播放列表、历史、浏览各标签）显示封面缩略图
+- 缩略图大小可通过滑动条调节（60–160px 宽，高度按 16:9 自动计算）
+- 缓存层统一输出固定尺寸画布（160×90），非标准比例的图片等比缩放后居中放置，确保列表文字对齐
+- 异步下载 + LRU 缓存（100 条），不阻塞 UI
+
+### 推荐
+
+播放列表下方显示当前视频的相关推荐（至多 5 条），双击即可播放并将推荐列表设为新的播放列表。
+
+---
+
+## 视频增强
+
+除了音频 AI 超分辨率，VentiPlayer 还提供基于 mpv GLSL shader 的视频增强管线。所有增强在 GPU 上实时渲染，不额外占用 CPU。
+
+### 已实现
+
+| 功能 | 说明 |
+|---|---|
+| 基础画面调整 | 亮度 / 对比度 / 饱和度 / Gamma，通过 mpv 属性实时调节 |
+| CAS 锐化 | AMD FidelityFX CAS shader，强度 0.0–1.0 可调，运行时模板生成 |
+| 去色带 (Deband) | mpv 内置 deband 滤镜，可调迭代 / 阈值 / 范围 |
+| 降噪 | hqdn3d 或 nlmeans 算法，强度可调 |
+| HDR 色调映射 | 支持 mobius / reinhard / hable / bt.2390 / spline 等算法 + 动态峰值检测 |
+| 超分辨率 | 统一入口，下拉选择算法，启用后状态栏显示实际输出分辨率 |
+
+#### 超分辨率算法
+
+| 算法 | 参数 | 适用场景 |
+|---|---|---|
+| **Anime4K** | 模式 (A/B/C/A+A/B+B/C+A) × 质量 (Fast/HQ) | 动画片源，x2 放大 |
+| **FSR** | 锐化强度 (0.0–2.0) + RCAS 降噪开关 | 通用片源，AMD FidelityFX Super Resolution |
+| **FSRCNNX** | 无可调参数 | 通用片源，神经网络超分 (FSRCNNX_x2_16-0-4-1) |
+
+- Anime4K 模式说明：A = 1080p/高模糊源，B = 720p/低模糊源，C = 480p/无退化源；A+A / B+B / C+A 为对应加强版（更高质量，更慢）
+- FSR 和 CAS 均采用模板生成模式：运行时将参数写入 `*_active.glsl`，mpv 加载生成后的 shader
+
+### 计划中
+
+| 功能 | 说明 | 状态 |
+|---|---|---|
+| 视频插帧 | 基于 mpv 内置 interpolation（video-sync=display-resample + tscale）实现帧率提升，状态栏显示实际输出帧率 | 待开发 |
+
+### 面板布局
+
+视频增强面板采用双栏布局：
+
+- **左栏**：基础画面调整、CAS 锐化、去色带、降噪、HDR 色调映射
+- **右栏**：超分辨率（+ 未来的插帧）
+
+### 状态栏指示
+
+信息栏右侧提供三个指示灯：
+
+| 指示灯 | 绿色 | 灰色 |
+|---|---|---|
+| 升频 | 音频 AI 增强已激活 | 播放源音频 |
+| 超分 | 视频超分 shader 已加载 | 未启用超分 |
+| 插帧 | 插帧已激活（未来） | 未启用插帧 |
+
+视频信息格式：`V-1920×1080-24fps → 3840×2160-24fps`（源分辨率 → 超分后输出分辨率）
 
 ---
 
@@ -340,6 +429,8 @@ VentiPlayer/
 2. 粘贴 URL 到顶部输入框，回车
 3. 默认走原音轨先播；想增强就在右侧面板勾选模式 → 等待 enhanced.wav 写够 → 自动切换音轨
 
+启动时及窗口重新获得焦点时，程序会自动检测剪贴板中的 Bilibili / YouTube 链接并填入 URL 栏触发解析（加载但不播放）。用户可先在右侧面板启用音频增强，再手动点击播放。
+
 ---
 
 ## 仓库布局与 .gitignore 说明
@@ -356,12 +447,13 @@ VentiPlayer/
 ├── LICENSE               # MIT
 ├── src/
 │   ├── main.py
-│   ├── gui/{main_window,player_widget,enhance_panel}.py
-│   ├── core/{stream,audio_pipe,enhancer,sync}.py
+│   ├── gui/{main_window,player_widget,enhance_panel,video_enhance_panel,content_browser,playlist_panel,settings_dialog,thumbnail_cache}.py
+│   ├── core/{stream,audio_pipe,enhancer,sync,playlist,bilibili_api}.py
 │   ├── models/{fastwave,audiosr_model}.py
 │   └── config/settings.py
 │
-├── models/.gitkeep       # 占位（实际权重在 ~/.ventiplayer）
+├── shaders/                  # GLSL shader 模板与 Anime4K/FSR/FSRCNNX 文件
+├── models/.gitkeep           # 占位（实际权重在 ~/.ventiplayer）
 │
 ├── .gitignore
 ├── .gitattributes

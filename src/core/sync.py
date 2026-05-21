@@ -2,6 +2,12 @@
 
 Handles PTS alignment between enhanced audio and video playback,
 dynamic buffer management, seek recovery, and seamless enhance toggle.
+
+Design philosophy: mpv handles A/V sync internally. This manager only
+applies gentle speed corrections when drift is persistent and large.
+It NEVER seeks when the current position is within the enhanced audio
+range — seeking a growing WAV file causes mpv to re-read the header
+and reset audio_pts, creating a feedback loop.
 """
 
 import logging
@@ -17,7 +23,7 @@ logger = logging.getLogger(__name__)
 class SyncState(Enum):
     IDLE = "idle"
     SYNCED = "synced"
-    RESYNCING = "resyncing"
+    CORRECTING = "correcting"
     FALLBACK = "fallback"
 
 
@@ -29,24 +35,23 @@ class SyncStatus:
     fallback_reason: str = ""
 
 
-# Maximum acceptable A/V drift before triggering resync
-MAX_DRIFT_MS = 80.0
 # Drift threshold for soft correction (speed adjustment)
-SOFT_DRIFT_MS = 30.0
+SOFT_DRIFT_MS = 50.0
 # How often to check sync (seconds)
-SYNC_CHECK_INTERVAL = 0.5
+SYNC_CHECK_INTERVAL = 1.0
+# Number of consecutive drift readings before acting
+DRIFT_CONFIRM_COUNT = 3
 
 
 class SyncManager:
     """Manages audio-video synchronization for enhanced audio playback.
 
     Strategy:
-    - mpv handles video + original audio natively with its own sync
-    - When enhanced audio replaces original, we track the PTS offset
-    - On seek: record the target position, let mpv seek video, then
-      align enhanced audio to the same position
-    - On drift: apply micro speed corrections to bring audio back in sync
-    - On failure: seamlessly fall back to original audio
+    - mpv handles A/V sync internally — it's good at this
+    - We NEVER seek when video_pos is within the enhanced audio range
+    - We only apply gentle speed corrections for persistent, confirmed drift
+    - Seeking a growing WAV causes mpv to re-read the header and reset
+      audio_pts, creating a feedback loop — so we avoid it entirely
     """
 
     def __init__(self):
@@ -65,9 +70,14 @@ class SyncManager:
 
         self._base_speed = 1.0
         self._correction_active = False
+        self._last_switch_time = 0.0
+        self._switch_cooldown = 8.0  # seconds after audio switch before checking drift
         self._last_seek_time = 0.0
-        self._seek_cooldown = 1.0  # seconds after seek before checking drift
-        self._pts_offset = 0.0  # offset between enhanced audio and video timeline
+        self._seek_cooldown = 3.0  # seconds after seek before checking drift
+        self._last_resume_time = 0.0
+        self._resume_cooldown = 3.0
+        self._enhanced_duration_s = 0.0
+        self._drift_history: list[float] = []  # recent drift readings for confirmation
 
         self._monitor_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
@@ -94,17 +104,15 @@ class SyncManager:
         self._original_audio_url = url
 
     def activate_enhanced(self, enhanced_path: str, position_at_switch: float = 0.0):
-        """Switch to enhanced audio and start sync monitoring.
-
-        Args:
-            enhanced_path: path to enhanced WAV file
-            position_at_switch: video position (seconds) when switch happens
-        """
+        """Switch to enhanced audio and start sync monitoring."""
         with self._lock:
             self._enhanced_audio_path = enhanced_path
             self._enhanced_active = True
-            self._pts_offset = position_at_switch
             self._state = SyncState.SYNCED
+            self._last_switch_time = time.monotonic()
+            self._last_seek_time = time.monotonic()
+            self._drift_history.clear()
+            self._correction_active = False
 
         if self._switch_audio_fn:
             self._switch_audio_fn(enhanced_path)
@@ -120,6 +128,7 @@ class SyncManager:
             self._enhanced_active = False
             self._state = SyncState.IDLE
             self._correction_active = False
+            self._drift_history.clear()
 
         if self._original_audio_url and self._switch_audio_fn:
             self._switch_audio_fn(self._original_audio_url)
@@ -132,15 +141,25 @@ class SyncManager:
         """Called when user seeks. Records timing to suppress drift checks."""
         with self._lock:
             self._last_seek_time = time.monotonic()
+            self._drift_history.clear()
             if self._correction_active:
                 self._correction_active = False
                 self._restore_speed()
 
+    def notify_resume(self):
+        """Called when playback resumes (unpause). Suppresses drift checks briefly."""
+        with self._lock:
+            self._last_resume_time = time.monotonic()
+            self._drift_history.clear()
+
+    def update_enhanced_duration(self, duration_s: float):
+        """Update how many seconds of enhanced audio are currently available."""
+        with self._lock:
+            self._enhanced_duration_s = duration_s
+
     def notify_speed_change(self, speed: float):
         """Called when user changes playback speed."""
         self._base_speed = speed
-        if not self._correction_active:
-            pass  # speed already set by user
 
     def fallback_to_original(self, reason: str = ""):
         """Emergency fallback to original audio."""
@@ -150,6 +169,7 @@ class SyncManager:
             self._state = SyncState.FALLBACK
             self._enhanced_active = False
             self._correction_active = False
+            self._drift_history.clear()
 
         if self._original_audio_url and self._switch_audio_fn:
             self._switch_audio_fn(self._original_audio_url)
@@ -184,7 +204,7 @@ class SyncManager:
         self._monitor_thread = None
 
     def _monitor_loop(self):
-        """Periodically check A/V drift and apply corrections."""
+        """Periodically check A/V drift and apply gentle corrections only."""
         while not self._stop_event.is_set():
             self._stop_event.wait(SYNC_CHECK_INTERVAL)
             if self._stop_event.is_set():
@@ -193,7 +213,12 @@ class SyncManager:
             with self._lock:
                 if not self._enhanced_active:
                     break
-                if time.monotonic() - self._last_seek_time < self._seek_cooldown:
+                now = time.monotonic()
+                if now - self._last_seek_time < self._seek_cooldown:
+                    continue
+                if now - self._last_switch_time < self._switch_cooldown:
+                    continue
+                if now - self._last_resume_time < self._resume_cooldown:
                     continue
 
             try:
@@ -202,7 +227,12 @@ class SyncManager:
                 logger.warning(f"Sync check error: {e}")
 
     def _check_drift(self):
-        """Measure A/V drift and apply correction if needed."""
+        """Measure A/V drift and apply ONLY gentle speed corrections.
+
+        Key rule: NEVER seek when video_pos is within the enhanced audio range.
+        mpv handles A/V sync internally. We only nudge speed if drift is
+        persistent and confirmed over multiple readings.
+        """
         if not self._video_position_fn or not self._audio_position_fn:
             return
 
@@ -217,43 +247,61 @@ class SyncManager:
         if video_pos <= 0 or audio_pos <= 0:
             return
 
+        # If video position is within the enhanced audio range, mpv can handle
+        # sync internally. We only apply gentle speed corrections for persistent drift.
+        with self._lock:
+            frontier = self._enhanced_duration_s
+
+        # Near the write frontier — mpv reads erratic data, skip entirely
+        if frontier > 0 and video_pos > frontier - 5.0:
+            if self._correction_active:
+                self._correction_active = False
+                self._restore_speed()
+            return
+
         drift_ms = (audio_pos - video_pos) * 1000.0
 
-        action = None  # "hard_resync", "soft_correct", or "restore"
-        target_speed = self._base_speed
-
+        # Record drift reading for confirmation
         with self._lock:
-            if abs(drift_ms) > MAX_DRIFT_MS:
-                self._state = SyncState.RESYNCING
-                self._correction_active = False
-                action = "hard_resync"
-            elif abs(drift_ms) > SOFT_DRIFT_MS:
+            self._drift_history.append(drift_ms)
+            # Keep only recent readings
+            if len(self._drift_history) > DRIFT_CONFIRM_COUNT:
+                self._drift_history = self._drift_history[-DRIFT_CONFIRM_COUNT:]
+
+            # Only act if we have enough confirmed readings all showing drift
+            # in the same direction and above threshold
+            if len(self._drift_history) < DRIFT_CONFIRM_COUNT:
+                return
+
+            all_above = all(abs(d) > SOFT_DRIFT_MS for d in self._drift_history)
+            same_direction = (
+                all(d > 0 for d in self._drift_history) or
+                all(d < 0 for d in self._drift_history)
+            )
+
+            if all_above and same_direction:
+                avg_drift = sum(self._drift_history) / len(self._drift_history)
+                # Apply gentle speed correction (1% adjustment)
                 if not self._correction_active:
                     self._correction_active = True
-                correction = 1.0 + (0.02 if drift_ms < 0 else -0.02)
+                correction = 1.0 + (0.01 if avg_drift < 0 else -0.01)
                 target_speed = self._base_speed * correction
-                action = "soft_correct"
+                self._state = SyncState.CORRECTING
+            elif self._correction_active:
+                # Drift resolved — restore normal speed
+                self._correction_active = False
+                self._drift_history.clear()
+                self._state = SyncState.SYNCED
+                self._restore_speed()
+                self._emit_status()
+                return
             else:
-                if self._correction_active:
-                    self._correction_active = False
-                    action = "restore"
-                self._state = SyncState.SYNCED
+                return
 
-        # Execute actions outside the lock to avoid deadlock
-        if action == "hard_resync":
-            logger.info(f"Hard resync: drift={drift_ms:.0f}ms, seeking audio to video pos")
-            if self._set_speed_fn:
-                self._set_speed_fn(self._base_speed)
-            if self._seek_fn:
-                self._seek_fn(video_pos)
-            with self._lock:
-                self._last_seek_time = time.monotonic()
-                self._state = SyncState.SYNCED
-        elif action == "soft_correct":
-            if self._set_speed_fn:
-                self._set_speed_fn(target_speed)
-        elif action == "restore":
-            self._restore_speed()
+        # Apply speed correction outside lock
+        if self._correction_active and self._set_speed_fn:
+            self._set_speed_fn(target_speed)
+            logger.debug(f"Soft correction: avg_drift={avg_drift:.0f}ms, speed={target_speed:.3f}")
 
         self._emit_status()
 

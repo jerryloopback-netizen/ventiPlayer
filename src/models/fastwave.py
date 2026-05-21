@@ -380,6 +380,12 @@ class FastWaveModel:
         hop = chunk_size // 2
         total_len = len(audio_low)
 
+        n_fft_bins = FILTER_LENGTH // 2 + 1
+        cutoff_bin = int(n_fft_bins * input_sr / target_sr)
+        band = torch.zeros(1, n_fft_bins, dtype=torch.long,
+                           device=self._device)
+        band[0, :cutoff_bin] = 1
+
         # Short audio: single pass without overlap-add windowing
         if total_len <= chunk_size:
             pad_len = chunk_size - total_len
@@ -403,12 +409,6 @@ class FastWaveModel:
         output = torch.zeros(padded_len, device=self._device)
         window = torch.hann_window(chunk_size, device=self._device)
         norm = torch.zeros(padded_len, device=self._device)
-
-        n_fft_bins = FILTER_LENGTH // 2 + 1
-        cutoff_bin = int(n_fft_bins * input_sr / target_sr)
-        band = torch.zeros(1, n_fft_bins, dtype=torch.long,
-                           device=self._device)
-        band[0, :cutoff_bin] = 1
 
         for start in range(0, padded_len - chunk_size + 1, hop):
             chunk = audio_low[start:start + chunk_size].unsqueeze(0)

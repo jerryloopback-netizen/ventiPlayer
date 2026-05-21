@@ -91,6 +91,10 @@ tmp/
 temp/
 ventiplayer_*/
 
+# Generated shader variants (written at runtime by VideoEnhancePanel)
+shaders/CAS_active.glsl
+shaders/FSR_active.glsl
+
 # Audio artifacts that may be dropped during testing
 *.wav
 *.flac

@@ -43,6 +43,8 @@ class EnhancePanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._blocked = False
+        self._stream_ready = False  # True after a stream has been resolved
+        self._model_loaded = False  # True after model is confirmed available
         self._setup_ui()
 
     def _setup_ui(self):
@@ -185,6 +187,7 @@ class EnhancePanel(QWidget):
         is_realtime = self._realtime_radio.isChecked()
         self._nfe_widget.setVisible(is_realtime)
         self._ddim_widget.setVisible(not is_realtime)
+        self._update_enhance_btn_state()
         self.settings_changed.emit(self.get_settings())
 
     def get_settings(self) -> dict:
@@ -208,11 +211,19 @@ class EnhancePanel(QWidget):
         self._model_label.setStyleSheet(
             "color: green;" if loaded else "color: gray;"
         )
-        self._enhance_btn.setEnabled(loaded and self._enable_check.isChecked())
+        self._model_loaded = loaded
+        self._update_enhance_btn_state()
 
     def set_enhance_enabled(self, enabled: bool):
+        self._stream_ready = enabled
+        self._update_enhance_btn_state()
+
+    def _update_enhance_btn_state(self):
+        """Recalculate whether the enhance button should be enabled."""
         self._enhance_btn.setEnabled(
-            enabled and self._enable_check.isChecked()
+            self._stream_ready
+            and self._model_loaded
+            and self._enable_check.isChecked()
             and not self._blocked
         )
 
@@ -225,9 +236,9 @@ class EnhancePanel(QWidget):
             self._enable_check.setText(
                 "启用带宽截止修复+采样率超分 (原始采样率≥模型原生输出)"
             )
-            self._enhance_btn.setEnabled(False)
         else:
             self._enable_check.setText("启用带宽截止修复+采样率超分")
+        self._update_enhance_btn_state()
 
     def show_progress(self, visible: bool):
         is_quality = self._quality_radio.isChecked()

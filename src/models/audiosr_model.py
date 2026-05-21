@@ -193,6 +193,7 @@ class AudioSRModel:
                 self._model.device = "cuda"
                 # Enable memory-efficient attention if available
                 torch.cuda.empty_cache()
+                self._warmup()
             else:
                 self._model = build_model(model_name="basic", device=self._device)
 
@@ -205,6 +206,36 @@ class AudioSRModel:
             logger.error(f"AudioSR load failed: {e}")
             self._model = None
             return False
+
+    def _warmup(self):
+        """Run a short dummy inference to force ROCm/HIP kernel JIT compilation.
+
+        Prevents 'LLVM ERROR: Can't get available size' on first real call.
+        """
+        import torch
+        import soundfile as sf
+        try:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                # Generate 0.5s of silence — enough to trigger all diffusion kernels
+                dummy_sr = 16000
+                dummy_audio = np.zeros(dummy_sr // 2, dtype=np.float32)
+                dummy_path = Path(tmp_dir) / "warmup.wav"
+                sf.write(str(dummy_path), dummy_audio, dummy_sr, subtype="FLOAT")
+
+                from audiosr import super_resolution
+                torch.cuda.empty_cache()
+                super_resolution(
+                    self._model,
+                    str(dummy_path),
+                    seed=42,
+                    guidance_scale=3.5,
+                    ddim_steps=3,  # minimal steps, just enough to compile kernels
+                    latent_t_per_second=12.8,
+                )
+                torch.cuda.empty_cache()
+            logger.debug("AudioSR warmup complete")
+        except Exception as e:
+            logger.warning(f"AudioSR warmup failed (non-fatal): {e}")
 
     def unload(self):
         if self._model is not None:
@@ -232,6 +263,19 @@ class AudioSRModel:
 
         if audio.ndim > 1:
             audio = audio.mean(axis=0)
+
+        # VRAM safety check before heavy diffusion inference
+        if self._device == "cuda":
+            free_mem = torch.cuda.mem_get_info(0)[0]
+            if free_mem < 300 * 1024 * 1024:
+                import gc
+                gc.collect()
+                torch.cuda.empty_cache()
+                free_mem = torch.cuda.mem_get_info(0)[0]
+                if free_mem < 200 * 1024 * 1024:
+                    raise RuntimeError(
+                        f"VRAM 不足 ({free_mem // (1024*1024)}MB)，无法安全执行 AudioSR 推理"
+                    )
 
         # Process in segments to fit in VRAM (max ~5s per segment)
         segment_duration = 5.12

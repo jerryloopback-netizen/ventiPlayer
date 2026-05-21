@@ -12,6 +12,8 @@ DEFAULT_CONFIG = {
     "cookie_browser": "edge",  # e.g. "chrome", "firefox", "edge"
     "volume": 100,
     "last_url": "",
+    "thumbnail_mode": False,
+    "thumbnail_size": 80,
 }
 
 CONFIG_PATH = Path.home() / ".ventiplayer" / "config.json"

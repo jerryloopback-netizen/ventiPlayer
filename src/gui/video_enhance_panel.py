@@ -1,0 +1,752 @@
+from pathlib import Path
+from PySide6.QtWidgets import (
+    QWidget, QGroupBox, QVBoxLayout, QHBoxLayout,
+    QCheckBox, QLabel, QSlider, QPushButton, QSpinBox,
+    QComboBox, QStackedWidget,
+)
+from PySide6.QtCore import Signal, Qt
+
+SHADERS_DIR = Path(__file__).resolve().parent.parent.parent / "shaders"
+_CAS_TEMPLATE = SHADERS_DIR / "CAS.glsl"
+_CAS_GENERATED = SHADERS_DIR / "CAS_active.glsl"
+_FSR_TEMPLATE = SHADERS_DIR / "FSR.glsl"
+_FSR_GENERATED = SHADERS_DIR / "FSR_active.glsl"
+
+# Anime4K v4.x preset system
+# Modes: A/B/C/A+A/B+B/C+A (content-type optimized)
+# Quality: 快速(S) / 均衡(M) / 质量(L) / 极致(VL) — maps to shader variant sizes
+# Scale: x2 (single pass) / x4 (two chained x2 passes)
+
+_ANIME4K_RESTORE = {
+    "A": {"S": "Anime4K_Restore_CNN_S.glsl", "M": "Anime4K_Restore_CNN_M.glsl",
+           "L": "Anime4K_Restore_CNN_L.glsl", "VL": "Anime4K_Restore_CNN_VL.glsl",
+           "UL": "Anime4K_Restore_CNN_UL.glsl"},
+    "B": {"S": "Anime4K_Restore_CNN_Soft_S.glsl", "M": "Anime4K_Restore_CNN_Soft_M.glsl",
+           "L": "Anime4K_Restore_CNN_Soft_L.glsl", "VL": "Anime4K_Restore_CNN_Soft_VL.glsl",
+           "UL": "Anime4K_Restore_CNN_Soft_UL.glsl"},
+    "C": {},  # Mode C uses Upscale_Denoise instead of separate Restore
+}
+
+_ANIME4K_UPSCALE = {
+    "S": "Anime4K_Upscale_CNN_x2_S.glsl",
+    "M": "Anime4K_Upscale_CNN_x2_M.glsl",
+    "L": "Anime4K_Upscale_CNN_x2_L.glsl",
+    "VL": "Anime4K_Upscale_CNN_x2_VL.glsl",
+    "UL": "Anime4K_Upscale_CNN_x2_UL.glsl",
+}
+
+_ANIME4K_UPSCALE_DENOISE = {
+    "S": "Anime4K_Upscale_Denoise_CNN_x2_S.glsl",
+    "M": "Anime4K_Upscale_Denoise_CNN_x2_M.glsl",
+    "L": "Anime4K_Upscale_Denoise_CNN_x2_L.glsl",
+    "VL": "Anime4K_Upscale_Denoise_CNN_x2_VL.glsl",
+    "UL": "Anime4K_Upscale_Denoise_CNN_x2_UL.glsl",
+}
+
+# Quality tier mapping: display name → shader variant size
+_ANIME4K_QUALITY_MAP = {
+    "快速": "S",
+    "均衡": "M",
+    "质量": "L",
+    "极致": "VL",
+    "极限 (性能开销极大)": "UL",
+}
+
+_ANIME4K_MODES = ["A", "B", "C", "A+A", "B+B", "C+A"]
+_ANIME4K_QUALITIES = list(_ANIME4K_QUALITY_MAP.keys())
+_ANIME4K_SCALES = ["x2", "x4"]
+
+_ANIME4K_MODE_DESC = {
+    "A": "1080p动画 / 高模糊源",
+    "B": "720p动画 / 低模糊源",
+    "C": "480p动画 / 无退化源",
+    "A+A": "A加强版 (双重修复+超分)",
+    "B+B": "B加强版 (双重修复+超分)",
+    "C+A": "C+A (去噪超分+修复超分)",
+}
+
+_ANIME4K_QUALITY_DESC = {
+    "快速": "S档 — 最快，适合低端GPU",
+    "均衡": "M档 — 速度与质量平衡",
+    "质量": "L档 — 高质量，需中端GPU",
+    "极致": "VL档 — 最高质量，需高端GPU",
+    "极限 (性能开销极大)": "UL档 — 极限质量，性能开销约为VL的两倍",
+}
+
+_HDR_TONE_MAPPING_ALGORITHMS = [
+    "auto", "bt.2390", "spline", "mobius", "reinhard", "hable", "clip",
+]
+
+_TSCALE_DESC = {
+    "oversample": "最近邻，无混合，保持锐利",
+    "triangle": "线性混合，锐利但有轻微重影",
+    "mitchell": "平滑但可能糊",
+    "gaussian": "高斯混合，较平滑",
+    "bicubic": "三次混合，最模糊",
+    "sphinx": "Sphinx窗口函数",
+}
+
+
+class VideoEnhancePanel(QWidget):
+    """视频画面增强控制面板"""
+
+    property_changed = Signal(str, object)
+    shader_changed = Signal(list)
+    deband_changed = Signal(bool, dict)
+    vf_changed = Signal(str)
+    hdr_changed = Signal(bool, dict)
+    upscale_factor_changed = Signal(int)  # 1 = off, 2 = x2, 4 = x4
+    interpolation_changed = Signal(bool, dict)  # (enabled, {video_sync, tscale, threshold})
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._setup_ui()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        group = QGroupBox("视频增强")
+        group_layout = QHBoxLayout(group)
+        group_layout.setSpacing(12)
+
+        # --- Left column: basic adjustments, CAS, deband, denoise, HDR ---
+        left_col = QVBoxLayout()
+        left_col.setSpacing(6)
+
+        # --- Basic adjustments ---
+        self._enable_basic = QCheckBox("基础画面调整")
+        self._enable_basic.toggled.connect(self._on_basic_toggled)
+        left_col.addWidget(self._enable_basic)
+
+        self._basic_widget = QWidget()
+        basic_layout = QVBoxLayout(self._basic_widget)
+        basic_layout.setContentsMargins(16, 0, 0, 0)
+        basic_layout.setSpacing(4)
+
+        self._sliders = {}
+        slider_defs = [
+            ("brightness", "亮度", -100, 100, 0),
+            ("contrast", "对比度", -100, 100, 0),
+            ("saturation", "饱和度", -100, 100, 0),
+            ("gamma", "Gamma", -100, 100, 0),
+        ]
+        for prop, label, lo, hi, default in slider_defs:
+            row = QHBoxLayout()
+            lbl = QLabel(f"{label}:")
+            lbl.setFixedWidth(52)
+            slider = QSlider(Qt.Orientation.Horizontal)
+            slider.setRange(lo, hi)
+            slider.setValue(default)
+            slider.setTickPosition(QSlider.TickPosition.NoTicks)
+            val_label = QLabel(str(default))
+            val_label.setFixedWidth(32)
+            val_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            slider.valueChanged.connect(
+                lambda v, p=prop, vl=val_label: self._on_slider_changed(p, v, vl)
+            )
+            row.addWidget(lbl)
+            row.addWidget(slider, 1)
+            row.addWidget(val_label)
+            basic_layout.addLayout(row)
+            self._sliders[prop] = (slider, val_label)
+
+        left_col.addWidget(self._basic_widget)
+        self._basic_widget.setEnabled(False)
+
+        # --- Sharpening (CAS shader) ---
+        self._enable_sharpen = QCheckBox("锐化 (CAS)")
+        self._enable_sharpen.toggled.connect(self._on_sharpen_toggled)
+        left_col.addWidget(self._enable_sharpen)
+
+        self._sharpen_widget = QWidget()
+        sharpen_layout = QHBoxLayout(self._sharpen_widget)
+        sharpen_layout.setContentsMargins(16, 0, 0, 0)
+        lbl = QLabel("强度:")
+        lbl.setFixedWidth(52)
+        self._sharpen_slider = QSlider(Qt.Orientation.Horizontal)
+        self._sharpen_slider.setRange(0, 10)
+        self._sharpen_slider.setValue(6)
+        self._sharpen_val = QLabel("0.6")
+        self._sharpen_val.setFixedWidth(32)
+        self._sharpen_val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self._sharpen_slider.valueChanged.connect(self._on_sharpen_strength_changed)
+        sharpen_layout.addWidget(lbl)
+        sharpen_layout.addWidget(self._sharpen_slider, 1)
+        sharpen_layout.addWidget(self._sharpen_val)
+        left_col.addWidget(self._sharpen_widget)
+        self._sharpen_widget.setEnabled(False)
+
+        # --- Deband ---
+        self._enable_deband = QCheckBox("去色带 (Deband)")
+        self._enable_deband.toggled.connect(self._on_deband_toggled)
+        left_col.addWidget(self._enable_deband)
+
+        self._deband_widget = QWidget()
+        deband_layout = QVBoxLayout(self._deband_widget)
+        deband_layout.setContentsMargins(16, 0, 0, 0)
+        deband_layout.setSpacing(4)
+
+        row_iter = QHBoxLayout()
+        row_iter.addWidget(QLabel("迭代:"))
+        self._deband_iterations = QSpinBox()
+        self._deband_iterations.setRange(1, 8)
+        self._deband_iterations.setValue(2)
+        self._deband_iterations.valueChanged.connect(self._emit_deband)
+        row_iter.addWidget(self._deband_iterations)
+        row_iter.addStretch()
+        deband_layout.addLayout(row_iter)
+
+        row_thresh = QHBoxLayout()
+        row_thresh.addWidget(QLabel("阈值:"))
+        self._deband_threshold = QSlider(Qt.Orientation.Horizontal)
+        self._deband_threshold.setRange(16, 128)
+        self._deband_threshold.setValue(48)
+        self._deband_thresh_val = QLabel("48")
+        self._deband_thresh_val.setFixedWidth(32)
+        self._deband_threshold.valueChanged.connect(
+            lambda v: (self._deband_thresh_val.setText(str(v)), self._emit_deband())
+        )
+        row_thresh.addWidget(self._deband_threshold, 1)
+        row_thresh.addWidget(self._deband_thresh_val)
+        deband_layout.addLayout(row_thresh)
+
+        row_range = QHBoxLayout()
+        row_range.addWidget(QLabel("范围:"))
+        self._deband_range = QSlider(Qt.Orientation.Horizontal)
+        self._deband_range.setRange(4, 64)
+        self._deband_range.setValue(16)
+        self._deband_range_val = QLabel("16")
+        self._deband_range_val.setFixedWidth(32)
+        self._deband_range.valueChanged.connect(
+            lambda v: (self._deband_range_val.setText(str(v)), self._emit_deband())
+        )
+        row_range.addWidget(self._deband_range, 1)
+        row_range.addWidget(self._deband_range_val)
+        deband_layout.addLayout(row_range)
+
+        left_col.addWidget(self._deband_widget)
+        self._deband_widget.setEnabled(False)
+
+        # --- Denoise ---
+        self._enable_denoise = QCheckBox("降噪")
+        self._enable_denoise.toggled.connect(self._on_denoise_toggled)
+        left_col.addWidget(self._enable_denoise)
+
+        self._denoise_widget = QWidget()
+        denoise_layout = QVBoxLayout(self._denoise_widget)
+        denoise_layout.setContentsMargins(16, 0, 0, 0)
+        denoise_layout.setSpacing(4)
+
+        row_mode = QHBoxLayout()
+        row_mode.addWidget(QLabel("算法:"))
+        self._denoise_mode = QComboBox()
+        self._denoise_mode.addItems(["hqdn3d", "nlmeans"])
+        self._denoise_mode.currentIndexChanged.connect(self._emit_vf)
+        row_mode.addWidget(self._denoise_mode)
+        row_mode.addStretch()
+        denoise_layout.addLayout(row_mode)
+
+        row_strength = QHBoxLayout()
+        row_strength.addWidget(QLabel("强度:"))
+        self._denoise_strength = QSlider(Qt.Orientation.Horizontal)
+        self._denoise_strength.setRange(1, 10)
+        self._denoise_strength.setValue(4)
+        self._denoise_strength_val = QLabel("4")
+        self._denoise_strength_val.setFixedWidth(20)
+        self._denoise_strength.valueChanged.connect(
+            lambda v: (self._denoise_strength_val.setText(str(v)), self._emit_vf())
+        )
+        row_strength.addWidget(self._denoise_strength, 1)
+        row_strength.addWidget(self._denoise_strength_val)
+        denoise_layout.addLayout(row_strength)
+
+        left_col.addWidget(self._denoise_widget)
+        self._denoise_widget.setEnabled(False)
+
+        # --- HDR Tone Mapping ---
+        self._enable_hdr = QCheckBox("HDR 色调映射")
+        self._enable_hdr.toggled.connect(self._on_hdr_toggled)
+        left_col.addWidget(self._enable_hdr)
+
+        self._hdr_widget = QWidget()
+        hdr_layout = QVBoxLayout(self._hdr_widget)
+        hdr_layout.setContentsMargins(16, 0, 0, 0)
+        hdr_layout.setSpacing(4)
+
+        row_algo = QHBoxLayout()
+        row_algo.addWidget(QLabel("算法:"))
+        self._hdr_algo = QComboBox()
+        self._hdr_algo.addItems(_HDR_TONE_MAPPING_ALGORITHMS)
+        self._hdr_algo.setCurrentIndex(1)
+        self._hdr_algo.currentIndexChanged.connect(self._emit_hdr)
+        row_algo.addWidget(self._hdr_algo)
+        row_algo.addStretch()
+        hdr_layout.addLayout(row_algo)
+
+        self._hdr_peak = QCheckBox("动态峰值检测")
+        self._hdr_peak.setChecked(True)
+        self._hdr_peak.toggled.connect(self._emit_hdr)
+        hdr_layout.addWidget(self._hdr_peak)
+
+        left_col.addWidget(self._hdr_widget)
+        self._hdr_widget.setEnabled(False)
+
+        left_col.addStretch()
+        group_layout.addLayout(left_col, 1)
+
+        # --- Right column: super-resolution + future interpolation ---
+        right_col = QVBoxLayout()
+        right_col.setSpacing(4)
+
+        # --- Super Resolution (unified) ---
+        self._enable_upscale = QCheckBox("超分辨率")
+        self._enable_upscale.toggled.connect(self._on_upscale_toggled)
+        right_col.addWidget(self._enable_upscale)
+
+        self._upscale_widget = QWidget()
+        upscale_layout = QVBoxLayout(self._upscale_widget)
+        upscale_layout.setContentsMargins(16, 0, 0, 0)
+        upscale_layout.setSpacing(2)
+
+        # Algorithm selector
+        row_algo_up = QHBoxLayout()
+        row_algo_up.addWidget(QLabel("算法:"))
+        self._upscale_algo = QComboBox()
+        self._upscale_algo.addItems(["Anime4K", "FSR", "FSRCNNX"])
+        self._upscale_algo.currentIndexChanged.connect(self._on_upscale_algo_changed)
+        row_algo_up.addWidget(self._upscale_algo, 1)
+        upscale_layout.addLayout(row_algo_up)
+
+        # Stacked widget for algorithm-specific parameters
+        self._upscale_params_stack = QStackedWidget()
+
+        # --- Anime4K params page ---
+        self._anime4k_params = QWidget()
+        a4k_layout = QVBoxLayout(self._anime4k_params)
+        a4k_layout.setContentsMargins(0, 2, 0, 0)
+        a4k_layout.setSpacing(2)
+
+        row_mode_a4k = QHBoxLayout()
+        row_mode_a4k.addWidget(QLabel("模式:"))
+        self._anime4k_mode = QComboBox()
+        self._anime4k_mode.addItems(_ANIME4K_MODES)
+        self._anime4k_mode.currentIndexChanged.connect(self._on_anime4k_params_changed)
+        row_mode_a4k.addWidget(self._anime4k_mode, 1)
+        a4k_layout.addLayout(row_mode_a4k)
+
+        self._anime4k_mode_desc = QLabel(_ANIME4K_MODE_DESC["A"])
+        self._anime4k_mode_desc.setStyleSheet("color: gray; font-size: 10px;")
+        self._anime4k_mode_desc.setContentsMargins(0, 0, 0, 0)
+        self._anime4k_mode_desc.setWordWrap(True)
+        a4k_layout.addWidget(self._anime4k_mode_desc)
+
+        row_scale_a4k = QHBoxLayout()
+        row_scale_a4k.addWidget(QLabel("倍率:"))
+        self._anime4k_scale = QComboBox()
+        self._anime4k_scale.addItems(_ANIME4K_SCALES)
+        self._anime4k_scale.setCurrentIndex(1)  # default x4
+        self._anime4k_scale.currentIndexChanged.connect(self._on_anime4k_params_changed)
+        row_scale_a4k.addWidget(self._anime4k_scale, 1)
+        a4k_layout.addLayout(row_scale_a4k)
+
+        row_quality = QHBoxLayout()
+        row_quality.addWidget(QLabel("质量:"))
+        self._anime4k_quality = QComboBox()
+        self._anime4k_quality.addItems(_ANIME4K_QUALITIES)
+        self._anime4k_quality.setCurrentIndex(1)  # default 均衡
+        self._anime4k_quality.currentIndexChanged.connect(self._on_anime4k_params_changed)
+        row_quality.addWidget(self._anime4k_quality, 1)
+        a4k_layout.addLayout(row_quality)
+
+        self._anime4k_quality_desc = QLabel(_ANIME4K_QUALITY_DESC["均衡"])
+        self._anime4k_quality_desc.setStyleSheet("color: gray; font-size: 10px;")
+        self._anime4k_quality_desc.setContentsMargins(0, 0, 0, 0)
+        a4k_layout.addWidget(self._anime4k_quality_desc)
+
+        self._upscale_params_stack.addWidget(self._anime4k_params)
+
+        # --- FSR params page ---
+        self._fsr_params = QWidget()
+        fsr_layout = QVBoxLayout(self._fsr_params)
+        fsr_layout.setContentsMargins(0, 2, 0, 0)
+        fsr_layout.setSpacing(2)
+
+        row_fsr_sharp = QHBoxLayout()
+        row_fsr_sharp.addWidget(QLabel("锐化:"))
+        self._fsr_sharpness = QSlider(Qt.Orientation.Horizontal)
+        self._fsr_sharpness.setRange(0, 20)
+        self._fsr_sharpness.setValue(2)
+        self._fsr_sharp_val = QLabel("0.2")
+        self._fsr_sharp_val.setFixedWidth(32)
+        self._fsr_sharp_val.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        self._fsr_sharpness.valueChanged.connect(self._on_fsr_params_changed)
+        row_fsr_sharp.addWidget(self._fsr_sharpness, 1)
+        row_fsr_sharp.addWidget(self._fsr_sharp_val)
+        fsr_layout.addLayout(row_fsr_sharp)
+
+        self._fsr_denoise = QCheckBox("RCAS 降噪")
+        self._fsr_denoise.setChecked(True)
+        self._fsr_denoise.toggled.connect(self._on_fsr_params_changed)
+        fsr_layout.addWidget(self._fsr_denoise)
+
+        self._upscale_params_stack.addWidget(self._fsr_params)
+
+        # --- FSRCNNX params page (no configurable params) ---
+        self._fsrcnnx_params = QWidget()
+        fsrcnnx_layout = QVBoxLayout(self._fsrcnnx_params)
+        fsrcnnx_layout.setContentsMargins(0, 2, 0, 0)
+        fsrcnnx_info = QLabel("神经网络超分，无可调参数")
+        fsrcnnx_info.setStyleSheet("color: gray; font-size: 10px;")
+        fsrcnnx_layout.addWidget(fsrcnnx_info)
+        self._upscale_params_stack.addWidget(self._fsrcnnx_params)
+
+        upscale_layout.addWidget(self._upscale_params_stack)
+        right_col.addWidget(self._upscale_widget)
+        self._upscale_widget.setEnabled(False)
+
+        # --- Frame Interpolation (mpv built-in) ---
+        self._enable_interp = QCheckBox("伪插帧 (display-resample)")
+        self._enable_interp.toggled.connect(self._on_interp_toggled)
+        right_col.addWidget(self._enable_interp)
+
+        self._interp_widget = QWidget()
+        interp_layout = QVBoxLayout(self._interp_widget)
+        interp_layout.setContentsMargins(16, 0, 0, 0)
+        interp_layout.setSpacing(2)
+
+        row_tscale = QHBoxLayout()
+        row_tscale.addWidget(QLabel("算法:"))
+        self._tscale_algo = QComboBox()
+        self._tscale_algo.addItems([
+            "oversample", "triangle", "mitchell",
+            "gaussian", "bicubic", "sphinx",
+        ])
+        self._tscale_algo.setCurrentIndex(0)
+        self._tscale_algo.currentIndexChanged.connect(self._on_interp_params_changed)
+        row_tscale.addWidget(self._tscale_algo, 1)
+        interp_layout.addLayout(row_tscale)
+
+        self._tscale_desc = QLabel("最近邻，无混合，保持锐利")
+        self._tscale_desc.setStyleSheet("color: gray; font-size: 10px;")
+        self._tscale_desc.setContentsMargins(0, 0, 0, 0)
+        interp_layout.addWidget(self._tscale_desc)
+
+        row_threshold = QHBoxLayout()
+        row_threshold.addWidget(QLabel("阈值:"))
+        self._interp_threshold = QSlider(Qt.Orientation.Horizontal)
+        self._interp_threshold.setRange(-1, 10)
+        self._interp_threshold.setValue(-1)
+        self._interp_threshold_val = QLabel("-1")
+        self._interp_threshold_val.setFixedWidth(24)
+        self._interp_threshold_val.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        self._interp_threshold.valueChanged.connect(self._on_interp_params_changed)
+        row_threshold.addWidget(self._interp_threshold, 1)
+        row_threshold.addWidget(self._interp_threshold_val)
+        interp_layout.addLayout(row_threshold)
+
+        self._interp_threshold_desc = QLabel("-1 = 始终插值")
+        self._interp_threshold_desc.setStyleSheet("color: gray; font-size: 10px;")
+        self._interp_threshold_desc.setContentsMargins(0, 0, 0, 0)
+        interp_layout.addWidget(self._interp_threshold_desc)
+
+        right_col.addWidget(self._interp_widget)
+        self._interp_widget.setEnabled(False)
+
+        right_col.addStretch()
+
+        # --- Reset button ---
+        self._reset_btn = QPushButton("重置全部")
+        self._reset_btn.clicked.connect(self._reset_all)
+        right_col.addWidget(self._reset_btn)
+
+        group_layout.addLayout(right_col, 1)
+
+        layout.addWidget(group)
+
+    # --- Callbacks ---
+
+    def _on_basic_toggled(self, checked: bool):
+        self._basic_widget.setEnabled(checked)
+        if checked:
+            for prop, (slider, _) in self._sliders.items():
+                self.property_changed.emit(prop, slider.value())
+        else:
+            for prop in self._sliders:
+                self.property_changed.emit(prop, 0)
+
+    def _on_slider_changed(self, prop: str, value: int, val_label: QLabel):
+        val_label.setText(str(value))
+        if self._enable_basic.isChecked():
+            self.property_changed.emit(prop, value)
+
+    def _on_sharpen_toggled(self, checked: bool):
+        self._sharpen_widget.setEnabled(checked)
+        self._emit_all_shaders()
+
+    def _on_sharpen_strength_changed(self, value: int):
+        self._sharpen_val.setText(f"{value / 10:.1f}")
+        self._emit_all_shaders()
+
+    def _on_deband_toggled(self, checked: bool):
+        self._deband_widget.setEnabled(checked)
+        self._emit_deband()
+
+    def _on_denoise_toggled(self, checked: bool):
+        self._denoise_widget.setEnabled(checked)
+        self._emit_vf()
+
+    def _on_hdr_toggled(self, checked: bool):
+        self._hdr_widget.setEnabled(checked)
+        self._emit_hdr()
+
+    def _on_upscale_toggled(self, checked: bool):
+        self._upscale_widget.setEnabled(checked)
+        self._emit_all_shaders()
+        factor = self._get_current_upscale_factor() if checked else 1
+        self.upscale_factor_changed.emit(factor)
+
+    def _on_upscale_algo_changed(self, index: int):
+        self._upscale_params_stack.setCurrentIndex(index)
+        if self._enable_upscale.isChecked():
+            self._emit_all_shaders()
+            self.upscale_factor_changed.emit(self._get_current_upscale_factor())
+
+    def _on_anime4k_params_changed(self, *_args):
+        mode = self._anime4k_mode.currentText()
+        quality = self._anime4k_quality.currentText()
+        self._anime4k_mode_desc.setText(_ANIME4K_MODE_DESC.get(mode, ""))
+        self._anime4k_quality_desc.setText(_ANIME4K_QUALITY_DESC.get(quality, ""))
+        if self._enable_upscale.isChecked():
+            self._emit_all_shaders()
+            self.upscale_factor_changed.emit(self._get_current_upscale_factor())
+
+    def _on_fsr_params_changed(self, *_args):
+        val = self._fsr_sharpness.value() / 10.0
+        self._fsr_sharp_val.setText(f"{val:.1f}")
+        if self._enable_upscale.isChecked():
+            self._emit_all_shaders()
+
+    def _on_interp_toggled(self, checked: bool):
+        self._interp_widget.setEnabled(checked)
+        self._emit_interpolation()
+
+    def _on_interp_params_changed(self, *_args):
+        tscale = self._tscale_algo.currentText()
+        self._tscale_desc.setText(_TSCALE_DESC.get(tscale, ""))
+        threshold = self._interp_threshold.value()
+        self._interp_threshold_val.setText(str(threshold))
+        if threshold == -1:
+            self._interp_threshold_desc.setText("-1 = 始终插值")
+        elif threshold == 0:
+            self._interp_threshold_desc.setText("0 = 仅帧率差距大时插值")
+        else:
+            self._interp_threshold_desc.setText(f"帧率差>{threshold}x时插值")
+        if self._enable_interp.isChecked():
+            self._emit_interpolation()
+
+    def _emit_interpolation(self):
+        enabled = self._enable_interp.isChecked()
+        params = {
+            "tscale": self._tscale_algo.currentText(),
+            "threshold": self._interp_threshold.value(),
+        }
+        self.interpolation_changed.emit(enabled, params)
+
+    def _emit_all_shaders(self, *_args):
+        """Combine CAS + super-resolution shaders into a single list."""
+        shaders = []
+        if self._enable_sharpen.isChecked():
+            cas_path = self._generate_cas_shader()
+            if cas_path:
+                shaders.append(cas_path)
+        if self._enable_upscale.isChecked():
+            algo = self._upscale_algo.currentText()
+            if algo == "Anime4K":
+                shaders.extend(self._get_anime4k_shaders())
+            elif algo == "FSR":
+                fsr_path = self._generate_fsr_shader()
+                if fsr_path:
+                    shaders.append(fsr_path)
+            elif algo == "FSRCNNX":
+                fsrcnnx = SHADERS_DIR / "FSRCNNX_x2_16-0-4-1.glsl"
+                if fsrcnnx.exists():
+                    shaders.append(str(fsrcnnx))
+        self.shader_changed.emit(shaders)
+
+    def _get_anime4k_shaders(self) -> list[str]:
+        """Build Anime4K shader chain based on mode, quality, and scale settings."""
+        mode = self._anime4k_mode.currentText()
+        quality_display = self._anime4k_quality.currentText()
+        scale = self._anime4k_scale.currentText()
+        variant = _ANIME4K_QUALITY_MAP.get(quality_display, "M")
+
+        shaders: list[str] = []
+
+        # Always start with Clamp_Highlights
+        shaders.append("Anime4K_Clamp_Highlights.glsl")
+
+        base_mode = mode.split("+")[0]  # "A+A" → "A", "C+A" → "C"
+        is_compound = "+" in mode
+
+        if base_mode == "C":
+            # Mode C: Upscale_Denoise (no separate Restore)
+            denoise_shader = _ANIME4K_UPSCALE_DENOISE.get(variant)
+            if denoise_shader:
+                shaders.append(denoise_shader)
+        else:
+            # Mode A/B: Restore + Upscale
+            restore_map = _ANIME4K_RESTORE.get(base_mode, {})
+            restore_shader = restore_map.get(variant)
+            if restore_shader:
+                shaders.append(restore_shader)
+            upscale_shader = _ANIME4K_UPSCALE.get(variant)
+            if upscale_shader:
+                shaders.append(upscale_shader)
+
+        # For compound modes (A+A, B+B, C+A): add second pass
+        if is_compound:
+            second_mode = mode.split("+")[1]  # "A+A" → "A", "C+A" → "A"
+            # AutoDownscale between passes
+            shaders.append("Anime4K_AutoDownscalePre_x2.glsl")
+            shaders.append("Anime4K_AutoDownscalePre_x4.glsl")
+            # Second pass restore + upscale
+            second_restore_map = _ANIME4K_RESTORE.get(second_mode, {})
+            # Use one tier lower for second pass to save performance
+            lower_variant = {"UL": "VL", "VL": "M", "L": "M", "M": "S", "S": "S"}[variant]
+            second_restore = second_restore_map.get(lower_variant)
+            if second_restore:
+                shaders.append(second_restore)
+            second_upscale = _ANIME4K_UPSCALE.get(lower_variant)
+            if second_upscale:
+                shaders.append(second_upscale)
+        elif scale == "x4":
+            # x4 mode for non-compound: add AutoDownscale + second upscale pass
+            shaders.append("Anime4K_AutoDownscalePre_x2.glsl")
+            shaders.append("Anime4K_AutoDownscalePre_x4.glsl")
+            # Second upscale pass uses one tier lower
+            lower_variant = {"UL": "VL", "VL": "M", "L": "M", "M": "S", "S": "S"}[variant]
+            second_upscale = _ANIME4K_UPSCALE.get(lower_variant)
+            if second_upscale:
+                shaders.append(second_upscale)
+
+        # Resolve paths and filter to existing files
+        result = []
+        for fname in shaders:
+            p = SHADERS_DIR / fname
+            if p.exists():
+                result.append(str(p))
+        return result
+
+    def _get_current_upscale_factor(self) -> int:
+        """Return the effective upscale factor based on current settings."""
+        algo = self._upscale_algo.currentText()
+        if algo == "Anime4K":
+            scale = self._anime4k_scale.currentText()
+            mode = self._anime4k_mode.currentText()
+            if "+" in mode:
+                return 4  # compound modes always do x4
+            return 4 if scale == "x4" else 2
+        # FSR and FSRCNNX are always x2
+        return 2
+
+    def _generate_cas_shader(self) -> str | None:
+        if not _CAS_TEMPLATE.exists():
+            return None
+        sharpness = self.get_cas_sharpness()
+        source = _CAS_TEMPLATE.read_text(encoding="utf-8")
+        source = source.replace(
+            "#define SHARPNESS 0.4",
+            f"#define SHARPNESS {sharpness:.2f}",
+        )
+        _CAS_GENERATED.write_text(source, encoding="utf-8")
+        return str(_CAS_GENERATED)
+
+    def _generate_fsr_shader(self) -> str | None:
+        if not _FSR_TEMPLATE.exists():
+            return None
+        sharpness = self._fsr_sharpness.value() / 10.0
+        denoise = 1 if self._fsr_denoise.isChecked() else 0
+        source = _FSR_TEMPLATE.read_text(encoding="utf-8")
+        source = source.replace(
+            "#define SHARPNESS 0.2",
+            f"#define SHARPNESS {sharpness:.1f}",
+        )
+        source = source.replace(
+            "#define FSR_RCAS_DENOISE 1",
+            f"#define FSR_RCAS_DENOISE {denoise}",
+        )
+        _FSR_GENERATED.write_text(source, encoding="utf-8")
+        return str(_FSR_GENERATED)
+
+    def _emit_deband(self, *_args):
+        enabled = self._enable_deband.isChecked()
+        params = {
+            "iterations": self._deband_iterations.value(),
+            "threshold": self._deband_threshold.value(),
+            "range": self._deband_range.value(),
+        }
+        self.deband_changed.emit(enabled, params)
+
+    def _emit_vf(self, *_args):
+        """Emit vf filter string for denoise."""
+        if not self._enable_denoise.isChecked():
+            self.vf_changed.emit("")
+            return
+        mode = self._denoise_mode.currentText()
+        strength = self._denoise_strength.value()
+        if mode == "hqdn3d":
+            vf = f"lavfi=[hqdn3d={strength}:{strength - 1}:{strength + 2}:{strength}]"
+        else:
+            vf = f"lavfi=[nlmeans=s={strength}:p=7:r=15]"
+        self.vf_changed.emit(vf)
+
+    def _emit_hdr(self, *_args):
+        enabled = self._enable_hdr.isChecked()
+        params = {
+            "tone-mapping": self._hdr_algo.currentText(),
+            "hdr-compute-peak": self._hdr_peak.isChecked(),
+        }
+        self.hdr_changed.emit(enabled, params)
+
+    def _reset_all(self):
+        self._enable_basic.setChecked(False)
+        self._enable_sharpen.setChecked(False)
+        self._enable_deband.setChecked(False)
+        self._enable_denoise.setChecked(False)
+        self._enable_hdr.setChecked(False)
+        self._enable_upscale.setChecked(False)
+        for prop, (slider, val_label) in self._sliders.items():
+            slider.setValue(0)
+            val_label.setText("0")
+            self.property_changed.emit(prop, 0)
+        self._sharpen_slider.setValue(6)
+        self._denoise_strength.setValue(4)
+        self._denoise_mode.setCurrentIndex(0)
+        self._hdr_algo.setCurrentIndex(1)
+        self._hdr_peak.setChecked(True)
+        self._deband_iterations.setValue(2)
+        self._deband_threshold.setValue(48)
+        self._deband_range.setValue(16)
+        self._upscale_algo.setCurrentIndex(0)
+        self._anime4k_mode.setCurrentIndex(0)
+        self._anime4k_scale.setCurrentIndex(1)  # default x4
+        self._anime4k_quality.setCurrentIndex(1)  # default 均衡
+        self._fsr_sharpness.setValue(2)
+        self._fsr_denoise.setChecked(True)
+        self._enable_interp.setChecked(False)
+        self._tscale_algo.setCurrentIndex(0)
+        self._interp_threshold.setValue(-1)
+        self.shader_changed.emit([])
+        self.deband_changed.emit(False, {})
+        self.vf_changed.emit("")
+        self.hdr_changed.emit(False, {})
+        self.upscale_factor_changed.emit(1)
+        self.interpolation_changed.emit(False, {})
+
+    def get_cas_sharpness(self) -> float:
+        return 1.0 - (self._sharpen_slider.value() / 10.0)

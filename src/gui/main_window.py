@@ -1,4 +1,5 @@
 import sys
+import re
 import logging
 import threading
 from pathlib import Path
@@ -6,28 +7,51 @@ from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLineEdit, QPushButton, QSlider, QLabel, QComboBox,
     QCheckBox, QStatusBar, QSplitter, QMessageBox, QFileDialog,
+    QApplication, QTabWidget,
 )
-from PySide6.QtCore import Qt, Slot, QTimer, Signal
+from PySide6.QtCore import Qt, Slot, QTimer, Signal, QEvent
 from PySide6.QtGui import QKeySequence, QShortcut
 
 from src.gui.player_widget import MpvPlayerWidget
 from src.gui.enhance_panel import EnhancePanel
+from src.gui.video_enhance_panel import VideoEnhancePanel
+from src.gui.playlist_panel import PlaylistPanel
+from src.gui.content_browser import ContentBrowser
+from src.gui.settings_dialog import SettingsDialog
+from src.gui.thumbnail_cache import ThumbnailCache
 from src.core.stream import (
     StreamResolver, StreamInfo, CookieStatus,
     check_cookie_status,
 )
+from src.core.playlist import PlaylistManager, VideoItem, PlayMode, HistoryManager
+from src.core.bilibili_api import BilibiliAPI, BiliVideoInfo, BiliVideoItem
 from src.core.enhancer import Enhancer, EnhanceMode, Backend
 from src.core.audio_pipe import AudioPipeline, PipelineState, PipelineStatus
 from src.core.sync import SyncManager, SyncState, SyncStatus
+from src.core.resource_monitor import ResourceMonitor
 from src.config.settings import Settings
 
 logger = logging.getLogger(__name__)
+
+# Regex for matching YouTube / Bilibili URLs in clipboard
+_CLIPBOARD_URL_RE = re.compile(
+    r'https?://(?:'
+    r'(?:www\.|m\.)?youtube\.com/watch\?'
+    r'|youtu\.be/'
+    r'|(?:www\.|m\.)?youtube\.com/(?:shorts|live|embed|v)/'
+    r'|(?:www\.)?bilibili\.com/video/[ABab]'
+    r'|b23\.tv/'
+    r')',
+    re.IGNORECASE,
+)
 
 
 class MainWindow(QMainWindow):
     _stream_resolved = Signal(object)
     _cookie_status_ready = Signal(object)
     _enhance_status_update = Signal(object)
+    _bili_info_ready = Signal(object)
+    _bili_related_ready = Signal(object)
     backend_ready = Signal()  # emitted when enhance panel backend info is set
 
     def __init__(self, predetected_device=None):
@@ -40,6 +64,18 @@ class MainWindow(QMainWindow):
         self._current_stream: StreamInfo | None = None
         self._last_state: str = ""
         self._is_fullscreen = False
+        self._was_maximized = False
+
+        # Playlist
+        self._playlist = PlaylistManager()
+        self._history_mgr = HistoryManager()
+
+        # Bilibili API client
+        self._bili_api = BilibiliAPI()
+        cookie_file = self._settings.get("cookie_file")
+        if cookie_file:
+            self._bili_api.set_cookies_from_file(cookie_file)
+        self._current_recommendations: list[BiliVideoItem] = []
 
         # Enhancement engine
         self._enhancer = Enhancer()
@@ -58,9 +94,20 @@ class MainWindow(QMainWindow):
         self._setup_shortcuts()
         self._connect_signals()
 
+        # Apply initial thumbnail mode and size from settings
+        thumb_size = self._settings.get("thumbnail_size")
+        if thumb_size and thumb_size != 80:
+            self._playlist_panel.set_thumbnail_size(thumb_size)
+            self._content_browser.set_thumbnail_size(thumb_size)
+        if self._settings.get("thumbnail_mode"):
+            self._playlist_panel.set_thumbnail_mode(True)
+            self._content_browser.set_thumbnail_mode(True)
+
         QTimer.singleShot(0, self._init_player)
         QTimer.singleShot(100, self._refresh_cookie_status)
         QTimer.singleShot(200, self._init_enhance_backend)
+        QTimer.singleShot(300, self._check_clipboard_url)
+        QTimer.singleShot(500, self._fetch_homepage_recommendations)
 
     def _create_resolver(self) -> StreamResolver:
         return StreamResolver(
@@ -82,11 +129,13 @@ class MainWindow(QMainWindow):
         self._url_input = QLineEdit()
         self._url_input.setPlaceholderText("输入 YouTube / B站 URL...")
         self._url_input.setText(self._settings.get("last_url"))
-        self._play_btn = QPushButton("播放")
+        self._play_btn = QPushButton("解析")
         self._stop_btn = QPushButton("停止")
+        self._settings_btn = QPushButton("设置")
         url_layout.addWidget(self._url_input, 1)
         url_layout.addWidget(self._play_btn)
         url_layout.addWidget(self._stop_btn)
+        url_layout.addWidget(self._settings_btn)
         self._main_layout.addWidget(self._url_bar)
 
         # Splitter: video + panel
@@ -98,10 +147,25 @@ class MainWindow(QMainWindow):
         self._player_widget.mouseDoubleClickEvent = lambda e: self._toggle_fullscreen()
         self._splitter.addWidget(self._player_widget)
 
-        # Right panel
-        self._right_panel = QWidget()
-        right_layout = QVBoxLayout(self._right_panel)
-        right_layout.setContentsMargins(4, 0, 0, 0)
+        # Right panel — Tab widget
+        self._right_tabs = QTabWidget()
+        self._right_tabs.setTabPosition(QTabWidget.TabPosition.North)
+
+        # Thumbnail cache (shared between playlist and content browser)
+        self._thumbnail_cache = ThumbnailCache(self)
+
+        # Tab 0: Playlist
+        playlist_tab = QWidget()
+        playlist_layout = QVBoxLayout(playlist_tab)
+        playlist_layout.setContentsMargins(4, 4, 4, 4)
+        self._playlist_panel = PlaylistPanel(self._playlist, self._history_mgr, self._thumbnail_cache)
+        playlist_layout.addWidget(self._playlist_panel)
+        self._right_tabs.addTab(playlist_tab, "播放列表")
+
+        # Tab 1: Audio
+        audio_tab = QWidget()
+        audio_layout = QVBoxLayout(audio_tab)
+        audio_layout.setContentsMargins(4, 4, 4, 4)
 
         # Audio device
         dev_layout = QHBoxLayout()
@@ -109,40 +173,34 @@ class MainWindow(QMainWindow):
         self._device_combo = QComboBox()
         self._device_combo.setMinimumWidth(180)
         dev_layout.addWidget(self._device_combo, 1)
-        right_layout.addLayout(dev_layout)
+        audio_layout.addLayout(dev_layout)
 
         # WASAPI exclusive
         self._exclusive_check = QCheckBox("WASAPI Exclusive")
         self._exclusive_check.setChecked(self._settings.get("audio_exclusive"))
-        right_layout.addWidget(self._exclusive_check)
-
-        # Cookie settings
-        cookie_layout = QHBoxLayout()
-        self._cookie_label = QLabel("Cookie:")
-        cookie_file = self._settings.get("cookie_file")
-        if cookie_file:
-            self._cookie_status_label = QLabel(Path(cookie_file).name)
-        else:
-            self._cookie_status_label = QLabel("未配置")
-        self._cookie_status_label.setStyleSheet("color: gray;")
-        self._cookie_btn = QPushButton("导入...")
-        self._cookie_btn.setToolTip("导入 cookies.txt (Netscape 格式)")
-        self._cookie_btn.setFixedWidth(56)
-        self._cookie_auto_btn = QPushButton("帮助")
-        self._cookie_auto_btn.setToolTip("查看 Cookie 导出教程")
-        self._cookie_auto_btn.setFixedWidth(42)
-        cookie_layout.addWidget(self._cookie_label)
-        cookie_layout.addWidget(self._cookie_status_label, 1)
-        cookie_layout.addWidget(self._cookie_btn)
-        cookie_layout.addWidget(self._cookie_auto_btn)
-        right_layout.addLayout(cookie_layout)
+        audio_layout.addWidget(self._exclusive_check)
 
         # Enhance panel
         self._enhance_panel = EnhancePanel()
-        right_layout.addWidget(self._enhance_panel)
+        audio_layout.addWidget(self._enhance_panel)
 
-        right_layout.addStretch()
-        self._splitter.addWidget(self._right_panel)
+        audio_layout.addStretch()
+        self._right_tabs.addTab(audio_tab, "音频")
+
+        # Tab 2: Video
+        video_tab = QWidget()
+        video_layout = QVBoxLayout(video_tab)
+        video_layout.setContentsMargins(4, 4, 4, 4)
+        self._video_enhance_panel = VideoEnhancePanel()
+        video_layout.addWidget(self._video_enhance_panel)
+        video_layout.addStretch()
+        self._right_tabs.addTab(video_tab, "视频")
+
+        # Tab 3: Browse (Content Browser)
+        self._content_browser = ContentBrowser(self._bili_api, self._thumbnail_cache)
+        self._right_tabs.addTab(self._content_browser, "浏览")
+
+        self._splitter.addWidget(self._right_tabs)
         self._splitter.setSizes([700, 260])
         self._main_layout.addWidget(self._splitter, 1)
 
@@ -151,9 +209,23 @@ class MainWindow(QMainWindow):
         transport_layout = QHBoxLayout(self._transport_bar)
         transport_layout.setContentsMargins(0, 0, 0, 0)
 
-        self._pause_btn = QPushButton("⏸")
+        _sym_style = "QPushButton { font-family: 'Segoe UI Symbol'; font-size: 14px; }"
+        _vs15 = "︎"
+
+        self._pause_btn = QPushButton(f"⏸{_vs15}")
         self._pause_btn.setFixedWidth(36)
         self._pause_btn.setToolTip("暂停/继续 (Space)")
+        self._pause_btn.setStyleSheet(_sym_style)
+
+        self._prev_btn = QPushButton(f"⏮{_vs15}")
+        self._prev_btn.setFixedWidth(36)
+        self._prev_btn.setToolTip("上一首 (P)")
+        self._prev_btn.setStyleSheet(_sym_style)
+
+        self._next_btn = QPushButton(f"⏭{_vs15}")
+        self._next_btn.setFixedWidth(36)
+        self._next_btn.setToolTip("下一首 (N)")
+        self._next_btn.setStyleSheet(_sym_style)
 
         self._speed_btn = QPushButton("1x")
         self._speed_btn.setFixedWidth(40)
@@ -162,9 +234,24 @@ class MainWindow(QMainWindow):
         self._speed_options = [0.5, 1.0, 1.25, 1.5, 2.0, 3.0]
         self._speed_index = 1  # default 1x
 
-        self._fullscreen_btn = QPushButton("⛶")
+        # Play mode cycle button
+        self._mode_btn = QPushButton("顺序")
+        self._mode_btn.setFixedWidth(44)
+        self._mode_btn.setToolTip("播放模式: 顺序播放")
+        self._mode_btn.setStyleSheet("QPushButton { font-size: 11px; }")
+        self._mode_btn.clicked.connect(self._cycle_play_mode)
+        self._play_mode_index = 0
+        self._play_modes = [
+            (PlayMode.SEQUENTIAL, "顺序", "播放模式: 顺序播放"),
+            (PlayMode.SINGLE_LOOP, "单曲", "播放模式: 单曲循环"),
+            (PlayMode.LIST_LOOP, "列表", "播放模式: 列表循环"),
+            (PlayMode.SHUFFLE, "随机", "播放模式: 随机播放"),
+        ]
+
+        self._fullscreen_btn = QPushButton(f"⛶{_vs15}")
         self._fullscreen_btn.setFixedWidth(36)
         self._fullscreen_btn.setToolTip("全屏 (F)")
+        self._fullscreen_btn.setStyleSheet(_sym_style)
 
         self._pos_label = QLabel("00:00")
         self._pos_label.setFixedWidth(52)
@@ -172,14 +259,18 @@ class MainWindow(QMainWindow):
         self._seek_slider.setRange(0, 1000)
         self._dur_label = QLabel("00:00")
         self._dur_label.setFixedWidth(52)
-        self._vol_label = QLabel("\U0001f50a")
+        self._vol_label = QLabel("🔊︎")
+        self._vol_label.setStyleSheet("font-family: 'Segoe UI Symbol'; font-size: 14px;")
         self._vol_slider = QSlider(Qt.Orientation.Horizontal)
         self._vol_slider.setRange(0, 150)
         self._vol_slider.setValue(self._settings.get("volume"))
         self._vol_slider.setFixedWidth(100)
 
         transport_layout.addWidget(self._pause_btn)
+        transport_layout.addWidget(self._prev_btn)
+        transport_layout.addWidget(self._next_btn)
         transport_layout.addWidget(self._speed_btn)
+        transport_layout.addWidget(self._mode_btn)
         transport_layout.addWidget(self._pos_label)
         transport_layout.addWidget(self._seek_slider, 1)
         transport_layout.addWidget(self._dur_label)
@@ -202,6 +293,19 @@ class MainWindow(QMainWindow):
         self._audio_source_indicator.setTextFormat(Qt.TextFormat.RichText)
         self._audio_source_indicator.setStyleSheet("font-size: 11px; margin-left: 6px;")
         self._status_bar.addPermanentWidget(self._audio_source_indicator)
+        self._upscale_indicator = QLabel("")
+        self._upscale_indicator.setTextFormat(Qt.TextFormat.RichText)
+        self._upscale_indicator.setStyleSheet("font-size: 11px; margin-left: 6px;")
+        self._status_bar.addPermanentWidget(self._upscale_indicator)
+        self._interp_indicator = QLabel("")
+        self._interp_indicator.setTextFormat(Qt.TextFormat.RichText)
+        self._interp_indicator.setStyleSheet("font-size: 11px; margin-left: 6px;")
+        self._status_bar.addPermanentWidget(self._interp_indicator)
+        self._resource_label = QLabel("")
+        self._resource_label.setStyleSheet(
+            "font-family: Consolas, monospace; font-size: 11px; margin-left: 8px;"
+        )
+        self._status_bar.addPermanentWidget(self._resource_label)
         self._cookie_info_label = QLabel("")
         self._cookie_info_label.setStyleSheet("color: gray; margin-left: 8px;")
         self._status_bar.addPermanentWidget(self._cookie_info_label)
@@ -209,6 +313,12 @@ class MainWindow(QMainWindow):
         # Media info state
         self._output_sr: int = 0  # actual output sample rate from mpv
         self._enhanced_duration_s: float = 0.0  # seconds of enhanced audio available
+        self._video_out_w: int = 0  # actual video output width (from video-out-params)
+        self._video_out_h: int = 0  # actual video output height (from video-out-params)
+        self._video_out_fps: float = 0.0  # actual video output fps
+        self._upscale_factor: int = 1  # 1 = no upscale, 2 = x2 shader active
+        self._upscale_actually_active: bool = False  # True only when upscale shaders verified loaded
+        self._interpolation_active: bool = False  # True when display-resample interpolation is on
 
     def _setup_shortcuts(self):
         QShortcut(QKeySequence(Qt.Key.Key_Space), self, self._toggle_pause)
@@ -217,14 +327,15 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence(Qt.Key.Key_Escape), self, self._exit_fullscreen)
         QShortcut(QKeySequence(Qt.Key.Key_Left), self, lambda: self._seek_relative(-5))
         QShortcut(QKeySequence(Qt.Key.Key_Right), self, lambda: self._seek_relative(5))
+        QShortcut(QKeySequence(Qt.Key.Key_N), self, self._play_next)
+        QShortcut(QKeySequence(Qt.Key.Key_P), self, self._play_prev)
 
     def _connect_signals(self):
         self._play_btn.clicked.connect(self._on_play)
         self._stop_btn.clicked.connect(self._on_stop)
+        self._settings_btn.clicked.connect(self._on_open_settings)
         self._pause_btn.clicked.connect(self._toggle_pause)
         self._fullscreen_btn.clicked.connect(self._toggle_fullscreen)
-        self._cookie_btn.clicked.connect(self._on_import_cookie)
-        self._cookie_auto_btn.clicked.connect(self._on_auto_cookie)
         self._url_input.returnPressed.connect(self._on_play)
         self._vol_slider.valueChanged.connect(self._on_volume_changed)
         self._seek_slider.sliderReleased.connect(self._on_seek)
@@ -232,12 +343,34 @@ class MainWindow(QMainWindow):
         self._exclusive_check.toggled.connect(self._on_exclusive_changed)
         self._stream_resolved.connect(self._handle_stream_resolved)
         self._cookie_status_ready.connect(self._handle_cookie_status)
+        # Playlist signals
+        self._prev_btn.clicked.connect(self._play_prev)
+        self._next_btn.clicked.connect(self._play_next)
+        self._playlist_panel.item_double_clicked.connect(self._on_playlist_jump)
+        self._playlist_panel.history_item_double_clicked.connect(self._on_history_play)
+        self._playlist_panel.recommendation_clicked.connect(self._on_recommendation_clicked)
+        self._player_widget.end_of_file.connect(self._play_next)
+        # Bilibili API signals
+        self._bili_info_ready.connect(self._on_bili_info_ready)
+        self._bili_related_ready.connect(self._on_bili_related_ready)
         # Enhancement signals
         self._enhance_panel.enhance_requested.connect(self._on_enhance_requested)
         self._enhance_panel.cancel_requested.connect(self._on_enhance_cancel)
         self._enhance_panel.settings_changed.connect(self._on_enhance_settings_changed)
         self._enhance_status_update.connect(self._handle_enhance_status)
         self._exclusive_check.toggled.connect(self._update_media_info)
+        # Video enhance panel signals
+        self._video_enhance_panel.property_changed.connect(self._on_video_property_changed)
+        self._video_enhance_panel.shader_changed.connect(self._on_video_shader_changed)
+        self._video_enhance_panel.deband_changed.connect(self._on_video_deband_changed)
+        self._video_enhance_panel.vf_changed.connect(self._on_video_vf_changed)
+        self._video_enhance_panel.hdr_changed.connect(self._on_video_hdr_changed)
+        self._video_enhance_panel.upscale_factor_changed.connect(self._on_upscale_factor_changed)
+        self._video_enhance_panel.interpolation_changed.connect(self._on_interpolation_changed)
+        # Content browser signals
+        self._content_browser.play_video.connect(self._on_browser_play)
+        self._content_browser.play_video_with_context.connect(self._on_browser_play_with_context)
+        self._content_browser.add_to_queue.connect(self._on_browser_add_queue)
 
     @Slot()
     def _init_player(self):
@@ -250,6 +383,7 @@ class MainWindow(QMainWindow):
         self._player_widget.seek_performed.connect(self._on_seek_performed)
         self._player_widget.audio_output_changed.connect(self._on_audio_output_changed)
         self._player_widget.audio_source_detected.connect(self._on_audio_source_detected)
+        self._player_widget.video_output_changed.connect(self._on_video_output_changed)
         self._refresh_devices()
         self._configure_sync()
 
@@ -338,6 +472,35 @@ class MainWindow(QMainWindow):
         self._cookie_info_label.setText(text)
 
     @Slot()
+    def _on_open_settings(self):
+        """Open the settings dialog."""
+        dlg = SettingsDialog(self._settings, self)
+        dlg.cookie_imported.connect(self._on_cookie_imported_from_settings)
+        dlg.thumbnail_mode_changed.connect(self._on_thumbnail_mode_changed)
+        dlg.thumbnail_size_changed.connect(self._on_thumbnail_size_changed)
+        dlg.exec()
+
+    @Slot(str)
+    def _on_cookie_imported_from_settings(self, path: str):
+        """Handle cookie import from the settings dialog."""
+        self._resolver = self._create_resolver()
+        self._bili_api.set_cookies_from_file(path)
+        self._status_label.setText("Cookie 已导入")
+        self._refresh_cookie_status()
+
+    @Slot(bool)
+    def _on_thumbnail_mode_changed(self, enabled: bool):
+        """Toggle thumbnail mode on playlist panel and content browser."""
+        self._playlist_panel.set_thumbnail_mode(enabled)
+        self._content_browser.set_thumbnail_mode(enabled)
+
+    @Slot(int)
+    def _on_thumbnail_size_changed(self, width: int):
+        """Update thumbnail display size on both panels."""
+        self._playlist_panel.set_thumbnail_size(width)
+        self._content_browser.set_thumbnail_size(width)
+
+    @Slot()
     def _on_import_cookie(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "导入 Cookie 文件", "",
@@ -346,9 +509,8 @@ class MainWindow(QMainWindow):
         if path:
             self._settings.set("cookie_file", path)
             self._settings.set("cookie_browser", "")
-            self._cookie_status_label.setText(Path(path).name)
-            self._cookie_status_label.setStyleSheet("color: green;")
             self._resolver = self._create_resolver()
+            self._bili_api.set_cookies_from_file(path)
             self._status_label.setText("Cookie 已导入")
             self._refresh_cookie_status()
 
@@ -392,8 +554,38 @@ class MainWindow(QMainWindow):
         self._current_stream = stream
         self.setWindowTitle(f"VentiPlayer — {stream.title}")
 
+        # Auto-add to playlist if not already present
+        if stream.url and not self._playlist.contains_url(stream.url):
+            source_type = "bilibili" if "bilibili" in stream.url else "youtube"
+            item = VideoItem(
+                bvid=stream.url.split("/")[-1] if source_type == "bilibili" else "",
+                title=stream.title,
+                duration=stream.duration,
+                thumbnail_url=stream.thumbnail or "",
+                source_type=source_type,
+                url=stream.url,
+            )
+            self._playlist.add(item)
+            self._playlist.set_current(len(self._playlist) - 1)
+
+        # Always add to history
+        if stream.url:
+            source_type = "bilibili" if "bilibili" in stream.url else "youtube"
+            history_item = VideoItem(
+                bvid=stream.url.split("/")[-1] if source_type == "bilibili" else "",
+                title=stream.title,
+                duration=stream.duration,
+                thumbnail_url=stream.thumbnail or "",
+                source_type=source_type,
+                url=stream.url,
+            )
+            self._history_mgr.add(history_item)
+
         self._output_sr = 0
         self._enhanced_duration_s = 0.0
+        self._video_out_w = 0
+        self._video_out_h = 0
+        self._video_out_fps = 0.0
         self._update_media_info()
 
         if stream.cookie_failed:
@@ -404,8 +596,11 @@ class MainWindow(QMainWindow):
         else:
             self._player_widget.play_url(stream.video_url or stream.audio_url, stream.http_headers)
 
+        # Load in paused state so user can enable enhancement before playback
+        self._player_widget.pause()
+
         if not stream.cookie_failed:
-            self._status_label.setText("播放中")
+            self._status_label.setText("已解析 — 按播放开始")
 
         # Store original audio URL for sync fallback
         original_audio = stream.audio_url or stream.video_url
@@ -424,6 +619,10 @@ class MainWindow(QMainWindow):
             self._enhance_panel.set_enhance_blocked(False)
             self._enhance_panel.set_enhance_enabled(True)
 
+        # Fetch Bilibili video info and recommendations in background
+        if stream.url and "bilibili" in stream.url:
+            self._fetch_bili_info(stream.url)
+
     @Slot()
     def _on_stop(self):
         self._player_widget.stop()
@@ -433,9 +632,16 @@ class MainWindow(QMainWindow):
         self._current_stream = None
         self._output_sr = 0
         self._enhanced_duration_s = 0.0
+        self._video_out_w = 0
+        self._video_out_h = 0
+        self._video_out_fps = 0.0
         self._enhanced_playing = False
+        self._upscale_actually_active = False
         self._media_info_label.setText("")
         self._audio_source_indicator.setText("")
+        self._upscale_indicator.setText("")
+        self._interp_indicator.setText("")
+        self._enhance_panel.set_enhance_enabled(False)
 
     @Slot(int)
     def _on_audio_output_changed(self, sr: int):
@@ -450,8 +656,54 @@ class MainWindow(QMainWindow):
             self._current_stream.audio_sample_rate = sr
             self._update_media_info()
 
+    @Slot(int, int, float)
+    def _on_video_output_changed(self, width: int, height: int, fps: float):
+        """Called when mpv's actual video output resolution changes (after shaders)."""
+        self._video_out_w = width
+        self._video_out_h = height
+        self._video_out_fps = fps
+        self._update_media_info()
+
+    @Slot(int)
+    def _on_upscale_factor_changed(self, factor: int):
+        """Called when the upscale shader factor changes (1=off, 2=x2).
+
+        This tracks the *intended* factor for the media info resolution display
+        (e.g. V-1920x1080 -> 3840x2160). The actual indicator color is driven by
+        _check_upscale_active() which verifies shaders are really loaded in mpv.
+        """
+        self._upscale_factor = factor
+        self._update_media_info()
+
+    @Slot(bool, dict)
+    def _on_interpolation_changed(self, enabled: bool, params: dict):
+        """Apply mpv interpolation (display-resample) settings."""
+        player = self._player_widget._player
+        if not player:
+            return
+        try:
+            if enabled:
+                tscale = params.get("tscale", "oversample")
+                threshold = params.get("threshold", -1)
+                player["video-sync"] = "display-resample"
+                player["interpolation"] = "yes"
+                player["tscale"] = tscale
+                if threshold == -1:
+                    player["interpolation-threshold"] = -1
+                else:
+                    player["interpolation-threshold"] = threshold / 10.0
+                self._interpolation_active = True
+            else:
+                player["video-sync"] = "audio"
+                player["interpolation"] = "no"
+                self._interpolation_active = False
+        except (RuntimeError, OSError) as e:
+            logger.warning("Failed to set interpolation: %s", e)
+            self._interpolation_active = False
+        self._update_media_info()
+
     def _update_media_info(self, *_args):
-        """Rebuild the media info label: V-res-fps | A-sr-cutoff(→output) | exclusive"""
+        """Rebuild the media info label: V-res-fps → out_res | A-sr-cutoff(→output) | exclusive"""
         stream = self._current_stream
         if not stream:
             self._media_info_label.setText("")
@@ -460,20 +712,61 @@ class MainWindow(QMainWindow):
 
         parts = []
 
-        # Video info: V-1080×720-30fps
-        v_parts = []
-        if stream.video_width and stream.video_height:
-            v_parts.append(f"{stream.video_width}×{stream.video_height}")
+        # Video info: V-1080×720-30fps or V-1080×720-30fps → 2160×1440-30fps
+        src_w = stream.video_width or 0
+        src_h = stream.video_height or 0
+        src_fps = stream.video_fps or 0.0
+
+        if src_w and src_h:
+            v_src = f"{src_w}×{src_h}"
         elif stream.video_resolution:
-            v_parts.append(stream.video_resolution)
-        if stream.video_fps:
-            fps_val = stream.video_fps
-            if fps_val == int(fps_val):
-                v_parts.append(f"{int(fps_val)}fps")
+            v_src = stream.video_resolution
+        else:
+            v_src = ""
+
+        fps_str = ""
+        if src_fps:
+            if src_fps == int(src_fps):
+                fps_str = f"{int(src_fps)}fps"
             else:
-                v_parts.append(f"{fps_val:.1f}fps")
-        if v_parts:
-            parts.append("V-" + "-".join(v_parts))
+                fps_str = f"{src_fps:.1f}fps"
+
+        if v_src:
+            v_info = f"V-{v_src}"
+            if fps_str:
+                v_info += f"-{fps_str}"
+
+            # Determine effective output FPS (display refresh rate if interpolation active)
+            effective_out_fps = self._video_out_fps
+            if self._interpolation_active:
+                try:
+                    player = self._player_widget._player
+                    display_fps = player["display-fps"] if player else None
+                    if display_fps and display_fps > 0:
+                        effective_out_fps = round(display_fps, 1)
+                except Exception:
+                    pass
+
+            # Show output resolution: use upscale factor applied to video-out-params
+            out_w = self._video_out_w * self._upscale_factor if self._video_out_w else 0
+            out_h = self._video_out_h * self._upscale_factor if self._video_out_h else 0
+            show_arrow = (self._upscale_factor > 1 and out_w > 0 and out_h > 0) or self._interpolation_active
+            if show_arrow:
+                if out_w == 0 or out_h == 0:
+                    out_w = self._video_out_w or src_w
+                    out_h = self._video_out_h or src_h
+                out_fps_str = ""
+                if effective_out_fps:
+                    if effective_out_fps == int(effective_out_fps):
+                        out_fps_str = f"{int(effective_out_fps)}fps"
+                    else:
+                        out_fps_str = f"{effective_out_fps:.1f}fps"
+                v_out = f"{out_w}×{out_h}"
+                if out_fps_str:
+                    v_out += f"-{out_fps_str}"
+                v_info += f" → {v_out}"
+
+            parts.append(v_info)
 
         # Audio info: A-44.1kHz-16kHz → 48kHz-24kHz
         a_str = self._format_audio_info(stream)
@@ -493,6 +786,8 @@ class MainWindow(QMainWindow):
         """Update the audio source indicator: green dot + '升频' or gray dot + '源音频'."""
         if not self._current_stream:
             self._audio_source_indicator.setText("")
+            self._upscale_indicator.setText("")
+            self._interp_indicator.setText("")
             return
         if self._enhanced_playing:
             self._audio_source_indicator.setText(
@@ -501,6 +796,34 @@ class MainWindow(QMainWindow):
         else:
             self._audio_source_indicator.setText(
                 '<span style="color: #9E9E9E; font-size: 14px;">●</span> 源音频'
+            )
+        # Upscale indicator — based on whether shaders are actually loaded
+        if getattr(self, '_upscale_actually_active', False):
+            self._upscale_indicator.setText(
+                '<span style="color: #4CAF50; font-size: 14px;">●</span> 超分'
+            )
+        else:
+            self._upscale_indicator.setText(
+                '<span style="color: #9E9E9E; font-size: 14px;">●</span> 未超分'
+            )
+        # Interpolation indicator — based on actual mpv video-sync state
+        if self._interpolation_active:
+            try:
+                player = self._player_widget._player
+                actual_sync = player["video-sync"] if player else None
+            except Exception:
+                actual_sync = None
+            if actual_sync == "display-resample":
+                self._interp_indicator.setText(
+                    '<span style="color: #4CAF50; font-size: 14px;">●</span> 伪插帧'
+                )
+            else:
+                self._interp_indicator.setText(
+                    '<span style="color: #FF9800; font-size: 14px;">●</span> 伪插帧(异常)'
+                )
+        else:
+            self._interp_indicator.setText(
+                '<span style="color: #9E9E9E; font-size: 14px;">●</span> 源帧率'
             )
 
     def _format_audio_info(self, stream: StreamInfo) -> str:
@@ -601,6 +924,14 @@ class MainWindow(QMainWindow):
         self._sync.notify_speed_change(speed)
 
     @Slot()
+    def _cycle_play_mode(self):
+        self._play_mode_index = (self._play_mode_index + 1) % len(self._play_modes)
+        mode, label, tooltip = self._play_modes[self._play_mode_index]
+        self._mode_btn.setText(label)
+        self._mode_btn.setToolTip(tooltip)
+        self._playlist.set_mode(mode)
+
+    @Slot()
     def _toggle_fullscreen(self):
         if self._is_fullscreen:
             self._exit_fullscreen()
@@ -608,9 +939,10 @@ class MainWindow(QMainWindow):
             self._enter_fullscreen()
 
     def _enter_fullscreen(self):
+        self._was_maximized = self.isMaximized()
         self._is_fullscreen = True
         self._url_bar.hide()
-        self._right_panel.hide()
+        self._right_tabs.hide()
         self.statusBar().hide()
         self.showFullScreen()
 
@@ -620,9 +952,12 @@ class MainWindow(QMainWindow):
             return
         self._is_fullscreen = False
         self._url_bar.show()
-        self._right_panel.show()
+        self._right_tabs.show()
         self.statusBar().show()
-        self.showNormal()
+        if self._was_maximized:
+            self.showMaximized()
+        else:
+            self.showNormal()
 
     def _seek_relative(self, seconds: float):
         if self._player_widget.duration > 0:
@@ -693,9 +1028,11 @@ class MainWindow(QMainWindow):
         }
         self._status_label.setText(state_map.get(state, state))
         if state == "playing":
-            self._pause_btn.setText("⏸")
+            self._pause_btn.setText("⏸︎")
+            # Notify sync manager that playback resumed — suppress drift checks briefly
+            self._sync.notify_resume()
         elif state == "paused":
-            self._pause_btn.setText("▶")
+            self._pause_btn.setText("▶︎")
 
     @staticmethod
     def _format_time(seconds: float) -> str:
@@ -706,6 +1043,33 @@ class MainWindow(QMainWindow):
             return f"{h}:{m:02d}:{s:02d}"
         return f"{m:02d}:{s:02d}"
 
+    def changeEvent(self, event):
+        """Auto-check clipboard when window regains focus."""
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.ActivationChange and self.isActiveWindow():
+            self._check_clipboard_url()
+
+    def _check_clipboard_url(self):
+        """Check clipboard for a YouTube/Bilibili URL and auto-fill + resolve."""
+        clipboard = QApplication.clipboard()
+        text = (clipboard.text() or "").strip()
+        if not text:
+            return
+        # Only proceed if it matches known URL patterns
+        if not _CLIPBOARD_URL_RE.search(text):
+            return
+        # Extract the first URL-like string (in case clipboard has extra text)
+        # Use the first line that matches
+        url = text.split()[0] if text else ""
+        if not _CLIPBOARD_URL_RE.search(url):
+            # Try full text as URL
+            url = text
+        # Don't re-trigger on the same URL already in the input
+        if url == self._url_input.text().strip():
+            return
+        self._url_input.setText(url)
+        self._on_play()
+
     def closeEvent(self, event):
         self._settings.flush()
         self._sync.cleanup()
@@ -713,6 +1077,263 @@ class MainWindow(QMainWindow):
         self._enhancer.unload()
         self._player_widget.destroy()
         event.accept()
+
+    # --- Playlist navigation ---
+
+    @Slot()
+    def _play_next(self):
+        if self._url_input.hasFocus():
+            return
+        item = self._playlist.next()
+        if item:
+            self._play_playlist_item(item)
+        elif self._current_recommendations:
+            # Auto-play from recommendations when queue is exhausted
+            rec = self._current_recommendations.pop(0)
+            url = f"https://www.bilibili.com/video/{rec.bvid}"
+            video_item = VideoItem(
+                bvid=rec.bvid,
+                title=rec.title,
+                duration=rec.duration,
+                thumbnail_url=rec.thumbnail,
+                source_type="bilibili",
+                url=url,
+            )
+            self._playlist.add(video_item)
+            self._playlist.set_current(len(self._playlist) - 1)
+            self._play_playlist_item(video_item)
+            # Update recommendations display
+            self._playlist_panel.set_recommendations(self._current_recommendations)
+
+    @Slot()
+    def _play_prev(self):
+        if self._url_input.hasFocus():
+            return
+        item = self._playlist.prev()
+        if item:
+            self._play_playlist_item(item)
+
+    @Slot(int)
+    def _on_playlist_jump(self, index: int):
+        self._playlist.set_current(index)
+        item = self._playlist.current()
+        if item:
+            self._play_playlist_item(item)
+
+    def _play_playlist_item(self, item: VideoItem):
+        self._url_input.setText(item.url)
+        self._status_label.setText("解析中...")
+        self._play_btn.setEnabled(False)
+        self._resolver.resolve_async(item.url, lambda result: self._stream_resolved.emit(result))
+
+    # --- Bilibili API integration ---
+
+    def _extract_bvid(self, url: str) -> str:
+        """Extract BV ID from a Bilibili URL."""
+        match = re.search(r'(BV[A-Za-z0-9]+)', url)
+        return match.group(1) if match else ""
+
+    def _fetch_bili_info(self, url: str):
+        """Fetch video info and related videos in a background thread."""
+        bvid = self._extract_bvid(url)
+        if not bvid:
+            return
+
+        def _worker():
+            try:
+                info = self._bili_api.get_video_info(bvid)
+                if info:
+                    self._bili_info_ready.emit(info)
+            except Exception as e:
+                logger.debug("Failed to fetch bili video info: %s", e)
+
+            try:
+                related = self._bili_api.get_related_videos(bvid)
+                if related:
+                    self._bili_related_ready.emit(related)
+            except Exception as e:
+                logger.debug("Failed to fetch bili related videos: %s", e)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _fetch_homepage_recommendations(self):
+        """Fetch B站 popular/recommended videos on startup for the playlist panel."""
+        def _worker():
+            try:
+                items = self._bili_api.get_popular()
+                if items:
+                    self._bili_related_ready.emit(items)
+            except Exception as e:
+                logger.debug("Failed to fetch homepage recommendations: %s", e)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    @Slot(object)
+    def _on_bili_info_ready(self, info: BiliVideoInfo):
+        """Handle video info arrival — show season prompt if applicable."""
+        if info and info.season_id and info.season_title:
+            self._playlist_panel.show_season_prompt(
+                info.season_title,
+                lambda: self._load_season(info.owner_mid, info.season_id),
+            )
+
+    @Slot(object)
+    def _on_bili_related_ready(self, items):
+        """Handle related videos arrival — store and display recommendations."""
+        if isinstance(items, tuple) and len(items) == 2:
+            msg_type, data = items
+            if msg_type == "season":
+                # Season videos loaded — set as the source playlist
+                video_items = []
+                for v in data:
+                    url = f"https://www.bilibili.com/video/{v.bvid}"
+                    video_items.append(VideoItem(
+                        bvid=v.bvid,
+                        title=v.title,
+                        duration=v.duration,
+                        thumbnail_url=v.thumbnail,
+                        source_type="bilibili",
+                        url=url,
+                    ))
+                current_url = self._url_input.text().strip()
+                self._playlist.set_playlist(video_items, current_url=current_url)
+                self._status_label.setText(f"已加载合集 ({len(data)} 个视频)")
+                return
+
+        # Regular related videos
+        if isinstance(items, list):
+            self._current_recommendations = list(items)
+            self._playlist_panel.set_recommendations(items)
+            self._content_browser.set_recommendations(items)
+
+    def _load_season(self, mid: int, season_id: int):
+        """Load all videos from a season into the playlist."""
+        def _worker():
+            try:
+                videos = self._bili_api.get_season_videos(mid, season_id)
+                if videos:
+                    self._bili_related_ready.emit(("season", videos))
+            except Exception as e:
+                logger.debug("Failed to load season: %s", e)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    @Slot(str)
+    def _on_recommendation_clicked(self, bvid: str):
+        """Handle double-click on a recommendation — set recommendations as playlist and play."""
+        if not bvid:
+            return
+        url = f"https://www.bilibili.com/video/{bvid}"
+
+        # Build playlist from all current recommendations
+        video_items = []
+        for r in self._current_recommendations:
+            r_url = f"https://www.bilibili.com/video/{r.bvid}"
+            video_items.append(VideoItem(
+                bvid=r.bvid,
+                title=r.title,
+                duration=r.duration,
+                thumbnail_url=r.thumbnail,
+                source_type="bilibili",
+                url=r_url,
+            ))
+
+        if video_items:
+            self._playlist.set_playlist(video_items, current_url=url)
+        else:
+            # Fallback: just add the single item
+            rec_item = None
+            for r in self._current_recommendations:
+                if r.bvid == bvid:
+                    rec_item = r
+                    break
+            video_item = VideoItem(
+                bvid=bvid,
+                title=rec_item.title if rec_item else bvid,
+                duration=rec_item.duration if rec_item else 0,
+                thumbnail_url=rec_item.thumbnail if rec_item else "",
+                source_type="bilibili",
+                url=url,
+            )
+            self._playlist.add(video_item)
+            self._playlist.set_current(len(self._playlist) - 1)
+
+        # Play the selected item
+        item = self._playlist.current()
+        if item:
+            self._play_playlist_item(item)
+
+    # --- Content browser handlers ---
+
+    @Slot(str)
+    def _on_browser_play(self, url: str):
+        """Play a video from the content browser (without context — single video playlist)."""
+        self._url_input.setText(url)
+        self._on_play()
+
+    @Slot(str, list)
+    def _on_browser_play_with_context(self, url: str, siblings: list):
+        """Play a video from the content browser with source context.
+
+        Sets the playlist to the full list of sibling videos from the source tab.
+        """
+        if siblings:
+            # Convert BiliVideoItem list to VideoItem list for the playlist
+            video_items = []
+            for v in siblings:
+                v_url = f"https://www.bilibili.com/video/{v.bvid}"
+                video_items.append(VideoItem(
+                    bvid=v.bvid,
+                    title=v.title,
+                    duration=v.duration or None,
+                    thumbnail_url=v.thumbnail if hasattr(v, 'thumbnail') else "",
+                    source_type="bilibili",
+                    url=v_url,
+                ))
+            self._playlist.set_playlist(video_items, current_url=url)
+        # The actual play is triggered by play_video signal -> _on_browser_play
+
+    @Slot(str)
+    def _on_history_play(self, url: str):
+        """Play a video from history — creates a single-item playlist."""
+        # Set playlist to just this one video
+        # (history play doesn't have source context)
+        self._url_input.setText(url)
+        self._on_play()
+
+    @Slot(str, str)
+    def _on_browser_add_queue(self, url: str, title: str):
+        """Add a video to queue without playing."""
+        bvid = ""
+        if "bilibili" in url:
+            parts = url.rstrip("/").split("/")
+            bvid = parts[-1] if parts else ""
+        item = VideoItem(
+            bvid=bvid,
+            title=title,
+            duration=None,
+            thumbnail_url="",
+            source_type="bilibili",
+            url=url,
+        )
+        self._playlist.add(item)
+
+    # --- Resource monitoring ---
+
+    def _start_resource_monitor(self, backend: Backend):
+        """Initialize the resource monitor and start periodic updates."""
+        self._resource_monitor = ResourceMonitor(backend)
+        self._resource_timer = QTimer(self)
+        self._resource_timer.timeout.connect(self._update_resource_stats)
+        self._resource_timer.start(1500)  # update every 1.5s
+        # Do an immediate first update
+        self._update_resource_stats()
+
+    @Slot()
+    def _update_resource_stats(self):
+        """Update the resource usage label in the status bar."""
+        text = self._resource_monitor.format_stats()
+        self._resource_label.setText(text)
 
     # --- Enhancement integration ---
 
@@ -827,6 +1448,7 @@ class MainWindow(QMainWindow):
                 else:
                     self._enhance_panel.set_model_status("未找到模型文件", False)
                 self.backend_ready.emit()
+                self._start_resource_monitor(info.backend)
                 return
             elif msg_type == "model_loaded":
                 self._enhance_panel.set_model_status("已加载", True)
@@ -841,6 +1463,8 @@ class MainWindow(QMainWindow):
         # Track how much enhanced audio is available
         if status.enhanced_duration_s > 0:
             self._enhanced_duration_s = status.enhanced_duration_s
+            # Keep sync manager aware of the write frontier
+            self._sync.update_enhanced_duration(status.enhanced_duration_s)
 
         if status.state == PipelineState.READY and status.enhanced_file:
             self._enhance_panel.show_progress(False)
@@ -872,3 +1496,138 @@ class MainWindow(QMainWindow):
             else:
                 self._status_label.setText(f"增强失败: {status.message}")
                 QMessageBox.warning(self, "增强失败", status.message)
+
+    # --- Video enhancement integration ---
+
+    @Slot(str, object)
+    def _on_video_property_changed(self, prop: str, value):
+        """Apply mpv video property change (brightness/contrast/saturation/gamma)."""
+        player = self._player_widget._player
+        if player:
+            try:
+                player[prop] = value
+            except (RuntimeError, OSError):
+                pass
+
+    # Keywords that identify upscale shaders (as opposed to CAS/sharpening-only shaders)
+    _UPSCALE_SHADER_KEYWORDS = (
+        "Anime4K_Upscale", "Anime4K_Restore", "Anime4K_Upscale_Denoise",
+        "FSR", "FSRCNNX",
+    )
+
+    @Slot(list)
+    def _on_video_shader_changed(self, shader_paths: list):
+        """Apply GLSL shader list to mpv and verify upscale shaders are actually loaded."""
+        player = self._player_widget._player
+        if not player:
+            self._upscale_actually_active = False
+            self._update_audio_source_indicator()
+            return
+        try:
+            if shader_paths:
+                # Verify all shader files exist on disk before applying
+                missing = [p for p in shader_paths if not Path(p).is_file()]
+                if missing:
+                    logger.warning("Shader files not found: %s", missing)
+                    # Only apply the ones that exist
+                    shader_paths = [p for p in shader_paths if Path(p).is_file()]
+
+                if shader_paths:
+                    sep = ";" if sys.platform == "win32" else ":"
+                    shader_str = sep.join(shader_paths)
+                    player.command("change-list", "glsl-shaders", "set", shader_str)
+                else:
+                    player.command("change-list", "glsl-shaders", "clr", "")
+            else:
+                player.command("change-list", "glsl-shaders", "clr", "")
+        except (RuntimeError, OSError) as e:
+            logger.warning("Failed to apply shaders: %s", e)
+            self._upscale_actually_active = False
+            self._update_audio_source_indicator()
+            return
+
+        # Verify: check if upscale-related shaders are actually present
+        self._upscale_actually_active = self._check_upscale_active(shader_paths)
+        self._update_audio_source_indicator()
+
+    def _check_upscale_active(self, applied_paths: list | None = None) -> bool:
+        """Check whether upscale shaders are actually active.
+
+        First checks the provided path list for upscale keywords. If no list is
+        provided, reads mpv's glsl-shaders property to determine what's loaded.
+        Returns True if at least one upscale shader is present and its file exists.
+        """
+        paths_to_check = applied_paths
+
+        if paths_to_check is None:
+            # Read back from mpv to see what's actually loaded
+            player = self._player_widget._player
+            if not player:
+                return False
+            try:
+                shader_prop = player["glsl-shaders"]
+                if not shader_prop:
+                    return False
+                sep = ";" if sys.platform == "win32" else ":"
+                paths_to_check = [p.strip() for p in shader_prop.split(sep) if p.strip()]
+            except (RuntimeError, OSError, TypeError):
+                return False
+
+        if not paths_to_check:
+            return False
+
+        for path_str in paths_to_check:
+            filename = Path(path_str).name
+            if any(kw in filename for kw in self._UPSCALE_SHADER_KEYWORDS):
+                # Confirm the file actually exists on disk
+                if Path(path_str).is_file():
+                    return True
+        return False
+
+    @Slot(bool, dict)
+    def _on_video_deband_changed(self, enabled: bool, params: dict):
+        """Apply deband settings to mpv."""
+        player = self._player_widget._player
+        if not player:
+            return
+        try:
+            player["deband"] = "yes" if enabled else "no"
+            if enabled and params:
+                if "iterations" in params:
+                    player["deband-iterations"] = params["iterations"]
+                if "threshold" in params:
+                    player["deband-threshold"] = params["threshold"]
+                if "range" in params:
+                    player["deband-range"] = params["range"]
+        except (RuntimeError, OSError):
+            pass
+
+    @Slot(str)
+    def _on_video_vf_changed(self, vf_str: str):
+        """Apply video filter (denoise) to mpv."""
+        player = self._player_widget._player
+        if not player:
+            return
+        try:
+            if vf_str:
+                player.command("vf", "set", vf_str)
+            else:
+                player.command("vf", "clr", "")
+        except (RuntimeError, OSError):
+            pass
+
+    @Slot(bool, dict)
+    def _on_video_hdr_changed(self, enabled: bool, params: dict):
+        """Apply HDR tone mapping settings to mpv."""
+        player = self._player_widget._player
+        if not player:
+            return
+        try:
+            if enabled:
+                player["tone-mapping"] = params.get("tone-mapping", "bt.2390")
+                player["hdr-compute-peak"] = "yes" if params.get("hdr-compute-peak", True) else "no"
+            else:
+                player["tone-mapping"] = "auto"
+                player["hdr-compute-peak"] = "auto"
+        except (RuntimeError, OSError):
+            pass
