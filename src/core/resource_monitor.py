@@ -115,14 +115,14 @@ class _ADLMonitor:
                 self._context, self._adapter_idx, ctypes.byref(pmlog)
             )
             if status == 0:
-                # pmlog[0] = size, then pairs of (valid, value) starting at index 1
-                # Sensor N is at: pmlog[1 + N*2] (valid), pmlog[1 + N*2 + 1] (value)
                 offset = 1 + self._SENSOR_GFX_ACTIVITY * 2
+                if offset + 1 >= 1024:
+                    return 0.0
                 valid = pmlog[offset]
                 value = pmlog[offset + 1]
-                if valid:
+                if valid and 0 <= value <= 100:
                     return float(value)
-        except Exception as e:
+        except (OSError, ValueError, IndexError) as e:
             logger.debug(f"ADL PMLog query failed: {e}")
         return 0.0
 

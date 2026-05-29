@@ -36,7 +36,7 @@ def _cleanup_stale_temp_dirs():
                 pass
 
 
-_cleanup_stale_temp_dirs()
+_stale_cleaned = False
 
 
 class PipelineState(Enum):
@@ -75,9 +75,15 @@ class AudioPipeline:
         Args:
             enhancer: src.core.enhancer.Enhancer instance
         """
+        global _stale_cleaned
+        if not _stale_cleaned:
+            _stale_cleaned = True
+            _cleanup_stale_temp_dirs()
+
         self._enhancer = enhancer
         self._worker_thread: Optional[threading.Thread] = None
         self._cancel = threading.Event()
+        self._generation = 0
         self._status = PipelineStatus()
         self._status_lock = threading.Lock()
         self._status_callback: Optional[Callable[[PipelineStatus], None]] = None
@@ -110,9 +116,11 @@ class AudioPipeline:
         """Start quality (AudioSR) enhancement in background thread."""
         self.cancel()
         self._cancel.clear()
+        self._generation += 1
+        gen = self._generation
         self._worker_thread = threading.Thread(
             target=self._quality_worker,
-            args=(audio_url, http_headers),
+            args=(audio_url, http_headers, gen),
             daemon=True,
         )
         self._worker_thread.start()
@@ -121,9 +129,11 @@ class AudioPipeline:
         """Start real-time (FastWave) enhancement in background thread."""
         self.cancel()
         self._cancel.clear()
+        self._generation += 1
+        gen = self._generation
         self._worker_thread = threading.Thread(
             target=self._realtime_worker,
-            args=(audio_url, http_headers),
+            args=(audio_url, http_headers, gen),
             daemon=True,
         )
         self._worker_thread.start()
@@ -175,7 +185,7 @@ class AudioPipeline:
                 return None, 0
 
             for frame in packet.decode():
-                arr = frame.to_ndarray()
+                arr = frame.to_ndarray(format='fltp')
                 if arr.ndim > 1:
                     arr = arr.mean(axis=0)
                 frames.append(arr.astype(np.float32))
@@ -190,14 +200,14 @@ class AudioPipeline:
         self._update_status(progress=0.3, message=f"解码完成 ({total_samples} samples @ {sample_rate}Hz)")
         return audio_data, sample_rate
 
-    def _quality_worker(self, audio_url: str, http_headers: dict = None):
+    def _quality_worker(self, audio_url: str, http_headers: dict = None, gen: int = 0):
         """Worker thread for quality (AudioSR) mode."""
         try:
             audio_data, sample_rate = self._decode_full_audio(audio_url, http_headers)
             if audio_data is None:
                 return
 
-            if self._cancel.is_set():
+            if self._cancel.is_set() or gen != self._generation:
                 return
 
             self._update_status(state=PipelineState.ENHANCING, progress=0.3,
@@ -213,20 +223,20 @@ class AudioPipeline:
             enhanced = self._enhancer.enhance_full(audio_data, sample_rate,
                                                    progress_callback=progress_cb)
 
-            if self._cancel.is_set():
+            if self._cancel.is_set() or gen != self._generation:
                 return
-
-            # Save enhanced audio to temp file
             import soundfile as sf
             output_sr = self._enhancer._target_sr
             output_path = Path(self._temp_dir) / "enhanced_quality.wav"
             sf.write(str(output_path), enhanced, output_sr, subtype="FLOAT")
 
+            enhanced_duration_s = len(enhanced) / output_sr
             self._update_status(
                 state=PipelineState.READY,
                 progress=1.0,
                 message="增强完成",
                 enhanced_file=str(output_path),
+                enhanced_duration_s=enhanced_duration_s,
             )
 
         except InterruptedError:
@@ -240,7 +250,7 @@ class AudioPipeline:
                                message=f"增强失败: {e}",
                                recoverable=True)
 
-    def _realtime_worker(self, audio_url: str, http_headers: dict = None):
+    def _realtime_worker(self, audio_url: str, http_headers: dict = None, gen: int = 0):
         """Worker thread for real-time (FastWave) mode."""
         try:
             import av
@@ -286,11 +296,11 @@ class AudioPipeline:
                                message="实时增强中...")
 
             for packet in container.demux(audio_stream):
-                if self._cancel.is_set():
+                if self._cancel.is_set() or gen != self._generation:
                     break
 
                 for frame in packet.decode():
-                    arr = frame.to_ndarray()
+                    arr = frame.to_ndarray(format='fltp')
                     if arr.ndim > 1:
                         arr = arr.mean(axis=0)
                     buffer = np.concatenate([buffer, arr.astype(np.float32)])
@@ -327,7 +337,7 @@ class AudioPipeline:
                         )
 
             # Process remaining buffer
-            if len(buffer) > 0 and not self._cancel.is_set():
+            if len(buffer) > 0 and not self._cancel.is_set() and gen == self._generation:
                 try:
                     enhanced = self._enhancer.enhance_chunk(buffer, sample_rate)
                 except RuntimeError as e:
@@ -346,7 +356,7 @@ class AudioPipeline:
             out_file.close()
             container.close()
 
-            if self._cancel.is_set():
+            if self._cancel.is_set() or gen != self._generation:
                 return
 
             if total_written_samples == 0:

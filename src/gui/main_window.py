@@ -29,6 +29,8 @@ from src.core.enhancer import Enhancer, EnhanceMode, Backend
 from src.core.audio_pipe import AudioPipeline, PipelineState, PipelineStatus
 from src.core.sync import SyncManager, SyncState, SyncStatus
 from src.core.resource_monitor import ResourceMonitor
+from src.core.subtitle import SubtitlePipeline, SubtitleStatus, extract_video_id
+from src.core.llm import LLMProvider, provider_from_dict
 from src.config.settings import Settings
 
 logger = logging.getLogger(__name__)
@@ -40,7 +42,10 @@ _CLIPBOARD_URL_RE = re.compile(
     r'|youtu\.be/'
     r'|(?:www\.|m\.)?youtube\.com/(?:shorts|live|embed|v)/'
     r'|(?:www\.)?bilibili\.com/video/[ABab]'
+    r'|live\.bilibili\.com/\d'
     r'|b23\.tv/'
+    r'|(?:www\.)?twitch\.tv/videos/\d'
+    r'|(?:www\.)?twitch\.tv/\w'
     r')',
     re.IGNORECASE,
 )
@@ -50,8 +55,10 @@ class MainWindow(QMainWindow):
     _stream_resolved = Signal(object)
     _cookie_status_ready = Signal(object)
     _enhance_status_update = Signal(object)
+    _subtitle_status_update = Signal(object)
     _bili_info_ready = Signal(object)
     _bili_related_ready = Signal(object)
+    _live_refresh_ready = Signal(object)
     backend_ready = Signal()  # emitted when enhance panel backend info is set
 
     def __init__(self, predetected_device=None):
@@ -90,6 +97,17 @@ class MainWindow(QMainWindow):
         self._sync = SyncManager()
         self._enhanced_playing = False  # True when enhanced audio is active
 
+        # Live stream state
+        self._is_live = False
+        self._live_url = ""  # original live URL for refresh
+        self._live_refresh_timer = QTimer(self)
+        self._live_refresh_timer.setInterval(25 * 60 * 1000)  # 25 minutes
+        self._live_refresh_timer.timeout.connect(self._on_live_refresh)
+        self._live_reconnect_attempts = 0
+
+        # Subtitle pipeline
+        self._subtitle_pipeline: SubtitlePipeline | None = None
+
         self._setup_ui()
         self._setup_shortcuts()
         self._connect_signals()
@@ -114,6 +132,14 @@ class MainWindow(QMainWindow):
             cookie_file=self._settings.get("cookie_file"),
             cookie_browser=self._settings.get("cookie_browser"),
         )
+
+    @staticmethod
+    def _detect_source_type(url: str) -> str:
+        if "bilibili" in url or "b23.tv" in url:
+            return "bilibili"
+        if "twitch.tv" in url:
+            return "twitch"
+        return "youtube"
 
     def _setup_ui(self):
         central = QWidget()
@@ -253,6 +279,17 @@ class MainWindow(QMainWindow):
         self._fullscreen_btn.setToolTip("全屏 (F)")
         self._fullscreen_btn.setStyleSheet(_sym_style)
 
+        # Subtitle controls
+        self._subtitle_lang_combo = QComboBox()
+        self._subtitle_lang_combo.addItems(["中文", "英文"])
+        self._subtitle_lang_combo.setFixedWidth(56)
+        self._subtitle_lang_combo.setToolTip("字幕语言")
+        self._subtitle_btn = QPushButton("字幕")
+        self._subtitle_btn.setFixedWidth(44)
+        self._subtitle_btn.setToolTip("生成 AI 字幕")
+        self._subtitle_btn.setStyleSheet("QPushButton { font-size: 11px; }")
+        self._subtitle_btn.clicked.connect(self._on_subtitle_requested)
+
         self._pos_label = QLabel("00:00")
         self._pos_label.setFixedWidth(52)
         self._seek_slider = QSlider(Qt.Orientation.Horizontal)
@@ -279,6 +316,9 @@ class MainWindow(QMainWindow):
         transport_layout.addWidget(self._vol_slider)
         transport_layout.addSpacing(8)
         transport_layout.addWidget(self._fullscreen_btn)
+        transport_layout.addSpacing(4)
+        transport_layout.addWidget(self._subtitle_lang_combo)
+        transport_layout.addWidget(self._subtitle_btn)
         self._main_layout.addWidget(self._transport_bar)
 
         # Status bar
@@ -349,10 +389,14 @@ class MainWindow(QMainWindow):
         self._playlist_panel.item_double_clicked.connect(self._on_playlist_jump)
         self._playlist_panel.history_item_double_clicked.connect(self._on_history_play)
         self._playlist_panel.recommendation_clicked.connect(self._on_recommendation_clicked)
-        self._player_widget.end_of_file.connect(self._play_next)
+        self._player_widget.end_of_file.connect(self._on_end_of_file)
         # Bilibili API signals
         self._bili_info_ready.connect(self._on_bili_info_ready)
         self._bili_related_ready.connect(self._on_bili_related_ready)
+        # Live stream refresh signal
+        self._live_refresh_ready.connect(self._handle_live_refresh)
+        # Subtitle signal
+        self._subtitle_status_update.connect(self._handle_subtitle_status)
         # Enhancement signals
         self._enhance_panel.enhance_requested.connect(self._on_enhance_requested)
         self._enhance_panel.cancel_requested.connect(self._on_enhance_cancel)
@@ -478,6 +522,7 @@ class MainWindow(QMainWindow):
         dlg.cookie_imported.connect(self._on_cookie_imported_from_settings)
         dlg.thumbnail_mode_changed.connect(self._on_thumbnail_mode_changed)
         dlg.thumbnail_size_changed.connect(self._on_thumbnail_size_changed)
+        dlg.llm_config_changed.connect(self._on_llm_config_changed)
         dlg.exec()
 
     @Slot(str)
@@ -554,23 +599,34 @@ class MainWindow(QMainWindow):
         self._current_stream = stream
         self.setWindowTitle(f"VentiPlayer — {stream.title}")
 
-        # Auto-add to playlist if not already present
-        if stream.url and not self._playlist.contains_url(stream.url):
-            source_type = "bilibili" if "bilibili" in stream.url else "youtube"
-            item = VideoItem(
-                bvid=stream.url.split("/")[-1] if source_type == "bilibili" else "",
-                title=stream.title,
-                duration=stream.duration,
-                thumbnail_url=stream.thumbnail or "",
-                source_type=source_type,
-                url=stream.url,
-            )
-            self._playlist.add(item)
-            self._playlist.set_current(len(self._playlist) - 1)
+        # Track live state
+        self._is_live = stream.is_live
+        if self._is_live:
+            self._live_url = self._url_input.text().strip()
 
-        # Always add to history
+        # Subtitle button visibility: hide for live, show for video
+        self._subtitle_btn.setVisible(not self._is_live)
+        self._subtitle_lang_combo.setVisible(not self._is_live)
+        if not self._is_live:
+            self._update_subtitle_btn_state()
+
+        # Playlist and history — skip playlist for live, still record in history
+        if not self._is_live:
+            if stream.url and not self._playlist.contains_url(stream.url):
+                source_type = self._detect_source_type(stream.url)
+                item = VideoItem(
+                    bvid=stream.url.split("/")[-1] if source_type == "bilibili" else "",
+                    title=stream.title,
+                    duration=stream.duration,
+                    thumbnail_url=stream.thumbnail or "",
+                    source_type=source_type,
+                    url=stream.url,
+                )
+                self._playlist.add(item)
+                self._playlist.set_current(len(self._playlist) - 1)
+
         if stream.url:
-            source_type = "bilibili" if "bilibili" in stream.url else "youtube"
+            source_type = self._detect_source_type(stream.url)
             history_item = VideoItem(
                 bvid=stream.url.split("/")[-1] if source_type == "bilibili" else "",
                 title=stream.title,
@@ -591,36 +647,52 @@ class MainWindow(QMainWindow):
         if stream.cookie_failed:
             self._status_label.setText("Cookie 读取失败 — 点击\"导入\"或\"自动\"按钮配置")
 
-        if stream.video_url and stream.audio_url and stream.video_url != stream.audio_url:
-            self._player_widget.play_av(stream.video_url, stream.audio_url, stream.http_headers)
-        else:
-            self._player_widget.play_url(stream.video_url or stream.audio_url, stream.http_headers)
-
-        # Load in paused state so user can enable enhancement before playback
-        self._player_widget.pause()
-
-        if not stream.cookie_failed:
-            self._status_label.setText("已解析 — 按播放开始")
-
-        # Store original audio URL for sync fallback
-        original_audio = stream.audio_url or stream.video_url
-        self._sync.set_original_audio(original_audio)
-        self._enhanced_playing = False
-
-        # Disable enhancement if source is lossless >= 48kHz (no benefit from super-res)
-        # Lossy codecs at 48kHz (e.g. opus, aac) still have bandwidth below Nyquist
-        _lossless_codecs = {"flac", "alac", "pcm", "wav", "pcm_s16le", "pcm_s24le", "pcm_f32le"}
-        sr = stream.audio_sample_rate or 0
-        codec = (stream.audio_codec or "").lower()
-        is_lossless_hires = sr >= 48000 and codec in _lossless_codecs
-        if is_lossless_hires:
+        if self._is_live:
+            # Live stream: use live-optimized playback, start immediately
+            stream_url = stream.video_url or stream.audio_url
+            self._player_widget.play_live(stream_url, stream.http_headers)
+            self._seek_slider.setEnabled(False)
+            self._dur_label.setText("LIVE")
             self._enhance_panel.set_enhance_blocked(True)
+            if not stream.cookie_failed:
+                self._status_label.setText("🔴 直播中")
+            # Start periodic stream refresh
+            self._live_reconnect_attempts = 0
+            self._live_refresh_timer.start()
         else:
-            self._enhance_panel.set_enhance_blocked(False)
-            self._enhance_panel.set_enhance_enabled(True)
+            # Normal video playback
+            self._seek_slider.setEnabled(True)
+            self._live_refresh_timer.stop()
+
+            if stream.video_url and stream.audio_url and stream.video_url != stream.audio_url:
+                self._player_widget.play_av(stream.video_url, stream.audio_url, stream.http_headers)
+            else:
+                self._player_widget.play_url(stream.video_url or stream.audio_url, stream.http_headers)
+
+            # Load in paused state so user can enable enhancement before playback
+            self._player_widget.pause()
+
+            if not stream.cookie_failed:
+                self._status_label.setText("已解析 — 按播放开始")
+
+            # Store original audio URL for sync fallback
+            original_audio = stream.audio_url or stream.video_url
+            self._sync.set_original_audio(original_audio)
+            self._enhanced_playing = False
+
+            # Disable enhancement if source is lossless >= 48kHz
+            _lossless_codecs = {"flac", "alac", "pcm", "wav", "pcm_s16le", "pcm_s24le", "pcm_f32le"}
+            sr = stream.audio_sample_rate or 0
+            codec = (stream.audio_codec or "").lower()
+            is_lossless_hires = sr >= 48000 and codec in _lossless_codecs
+            if is_lossless_hires:
+                self._enhance_panel.set_enhance_blocked(True)
+            else:
+                self._enhance_panel.set_enhance_blocked(False)
+                self._enhance_panel.set_enhance_enabled(True)
 
         # Fetch Bilibili video info and recommendations in background
-        if stream.url and "bilibili" in stream.url:
+        if stream.url and "bilibili" in stream.url and not self._is_live:
             self._fetch_bili_info(stream.url)
 
     @Slot()
@@ -628,7 +700,9 @@ class MainWindow(QMainWindow):
         self._player_widget.stop()
         self._status_label.setText("已停止")
         self._seek_slider.setValue(0)
+        self._seek_slider.setEnabled(True)
         self._pos_label.setText("00:00")
+        self._dur_label.setText("00:00")
         self._current_stream = None
         self._output_sr = 0
         self._enhanced_duration_s = 0.0
@@ -642,6 +716,11 @@ class MainWindow(QMainWindow):
         self._upscale_indicator.setText("")
         self._interp_indicator.setText("")
         self._enhance_panel.set_enhance_enabled(False)
+        # Reset live state
+        self._is_live = False
+        self._live_url = ""
+        self._live_refresh_timer.stop()
+        self._live_reconnect_attempts = 0
 
     @Slot(int)
     def _on_audio_output_changed(self, sr: int):
@@ -986,7 +1065,7 @@ class MainWindow(QMainWindow):
     @Slot(bool)
     def _on_exclusive_changed(self, checked: bool):
         self._settings.set("audio_exclusive", checked)
-        self._status_label.setText("WASAPI Exclusive 设置将在下次播放时生效")
+        self._player_widget.set_audio_exclusive(checked)
 
     @Slot(float)
     def _update_position(self, pos: float):
@@ -1010,7 +1089,8 @@ class MainWindow(QMainWindow):
 
     @Slot(float)
     def _update_duration(self, dur: float):
-        self._dur_label.setText(self._format_time(dur))
+        if not self._is_live:
+            self._dur_label.setText(self._format_time(dur))
 
     def _progress_visible(self) -> bool:
         return self._enhance_panel._progress.isVisible()
@@ -1056,29 +1136,78 @@ class MainWindow(QMainWindow):
         if not text:
             return
         # Only proceed if it matches known URL patterns
-        if not _CLIPBOARD_URL_RE.search(text):
+        match = _CLIPBOARD_URL_RE.search(text)
+        if not match:
             return
-        # Extract the first URL-like string (in case clipboard has extra text)
-        # Use the first line that matches
-        url = text.split()[0] if text else ""
-        if not _CLIPBOARD_URL_RE.search(url):
-            # Try full text as URL
-            url = text
+        # Extract the full URL (non-whitespace run containing the match)
+        start = match.start()
+        end = match.end()
+        while start > 0 and not text[start - 1].isspace():
+            start -= 1
+        while end < len(text) and not text[end].isspace():
+            end += 1
+        url = text[start:end]
         # Don't re-trigger on the same URL already in the input
         if url == self._url_input.text().strip():
             return
         self._url_input.setText(url)
-        self._on_play()
 
     def closeEvent(self, event):
+        self._live_refresh_timer.stop()
         self._settings.flush()
         self._sync.cleanup()
         self._pipeline.cleanup()
         self._enhancer.unload()
+        self._thumbnail_cache.shutdown()
         self._player_widget.destroy()
         event.accept()
 
     # --- Playlist navigation ---
+
+    @Slot()
+    def _on_end_of_file(self):
+        """Handle end-of-file: for live streams attempt reconnect, otherwise play next."""
+        if self._is_live:
+            self._live_reconnect_attempts += 1
+            if self._live_reconnect_attempts <= 3:
+                self._status_label.setText("直播流中断，正在重连...")
+                self._on_live_refresh()
+            else:
+                self._status_label.setText("直播已结束")
+                self._is_live = False
+                self._live_refresh_timer.stop()
+                self._seek_slider.setEnabled(True)
+                self._dur_label.setText("00:00")
+        else:
+            self._play_next()
+
+    def _on_live_refresh(self):
+        """Trigger a background re-resolve of the live stream URL."""
+        if not self._is_live or not self._live_url:
+            return
+        self._resolver.resolve_live_refresh(
+            self._live_url,
+            lambda result: self._live_refresh_ready.emit(result),
+        )
+
+    @Slot(object)
+    def _handle_live_refresh(self, result):
+        """Handle the result of a live stream URL refresh."""
+        if result is None or not isinstance(result, StreamInfo):
+            if self._live_reconnect_attempts > 0:
+                self._status_label.setText("直播已结束或无法重连")
+                self._is_live = False
+                self._live_refresh_timer.stop()
+                self._seek_slider.setEnabled(True)
+                self._dur_label.setText("00:00")
+            return
+
+        stream: StreamInfo = result
+        self._current_stream = stream
+        stream_url = stream.video_url or stream.audio_url
+        self._player_widget.replace_live_stream(stream_url, stream.http_headers)
+        self._live_reconnect_attempts = 0
+        self._status_label.setText("🔴 直播中")
 
     @Slot()
     def _play_next(self):
@@ -1285,7 +1414,7 @@ class MainWindow(QMainWindow):
                 video_items.append(VideoItem(
                     bvid=v.bvid,
                     title=v.title,
-                    duration=v.duration or None,
+                    duration=v.duration,
                     thumbnail_url=v.thumbnail if hasattr(v, 'thumbnail') else "",
                     source_type="bilibili",
                     url=v_url,
@@ -1631,3 +1760,95 @@ class MainWindow(QMainWindow):
                 player["hdr-compute-peak"] = "auto"
         except (RuntimeError, OSError):
             pass
+
+    # ─── Subtitle ───────────────────────────────────────────────────────
+
+    def _update_subtitle_btn_state(self):
+        """Enable/disable subtitle button based on LLM configuration."""
+        providers = self._settings.get("llm_providers") or []
+        has_llm = bool(providers)
+        self._subtitle_btn.setEnabled(has_llm)
+        if not has_llm:
+            self._subtitle_btn.setToolTip("请先在设置中配置 LLM 服务商")
+        else:
+            self._subtitle_btn.setToolTip("生成 AI 字幕")
+
+    @Slot()
+    def _on_llm_config_changed(self):
+        """Update subtitle button state when LLM config changes."""
+        self._update_subtitle_btn_state()
+
+    @Slot()
+    def _on_subtitle_requested(self):
+        """Handle subtitle button click."""
+        if not self._current_stream or self._is_live:
+            return
+
+        providers = self._settings.get("llm_providers") or []
+        default_name = self._settings.get("llm_default_provider") or ""
+        provider_data = None
+        for p in providers:
+            if p.get("name") == default_name:
+                provider_data = p
+                break
+        if not provider_data and providers:
+            provider_data = providers[0]
+
+        if not provider_data:
+            QMessageBox.information(self, "提示", "请先在设置中配置 LLM 服务商")
+            return
+
+        model_id = self._settings.get("subtitle_model") or "openai/whisper-large-v3"
+        lang_idx = self._subtitle_lang_combo.currentIndex()
+        language = "zh" if lang_idx == 0 else "en"
+
+        # Check cache first
+        video_id = extract_video_id(self._current_stream.url or self._url_input.text())
+        from src.core.subtitle import SUBTITLE_CACHE_DIR
+        cache_path = SUBTITLE_CACHE_DIR / f"{video_id}_{language}.srt"
+        if cache_path.exists():
+            self._load_subtitle(str(cache_path))
+            return
+
+        # Start pipeline
+        self._subtitle_btn.setEnabled(False)
+        self._subtitle_btn.setText("...")
+        self._status_label.setText("字幕生成中...")
+
+        llm_provider = provider_from_dict(provider_data)
+        self._subtitle_pipeline = SubtitlePipeline(
+            model_id=model_id,
+            llm_provider=llm_provider,
+            progress_callback=lambda s: self._subtitle_status_update.emit(s),
+        )
+        self._subtitle_pipeline.generate(
+            audio_url=self._current_stream.audio_url,
+            video_url=self._current_stream.url or self._url_input.text(),
+            language=language,
+            http_headers=self._current_stream.http_headers,
+        )
+
+    @Slot(object)
+    def _handle_subtitle_status(self, status: SubtitleStatus):
+        """Handle subtitle pipeline progress updates."""
+        if status.state == "done":
+            self._subtitle_btn.setEnabled(True)
+            self._subtitle_btn.setText("字幕")
+            self._status_label.setText("字幕已加载")
+            if status.srt_path:
+                self._load_subtitle(status.srt_path)
+        elif status.state == "error":
+            self._subtitle_btn.setEnabled(True)
+            self._subtitle_btn.setText("字幕")
+            self._status_label.setText(status.message)
+        else:
+            pct = int(status.progress * 100)
+            self._status_label.setText(f"字幕生成中 ({pct}%) — {status.message}")
+
+    def _load_subtitle(self, path: str):
+        """Load SRT into mpv and auto-start playback if paused at beginning."""
+        self._player_widget.load_subtitle(path)
+        # Auto-start if video is paused near the beginning
+        if not self._player_widget.is_playing and self._player_widget.position < 1.0:
+            self._player_widget.resume()
+        self._status_label.setText("字幕已加载")

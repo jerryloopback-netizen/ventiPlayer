@@ -29,6 +29,7 @@ class MpvPlayerWidget(QWidget):
         self._player: mpv.MPV | None = None
         self._duration = 0.0
         self._position = 0.0
+        self._file_has_played = False
         self._last_out_sr = 0
         self._last_in_sr = 0
         self._last_video_out = (0, 0, 0.0)  # (w, h, fps)
@@ -74,8 +75,9 @@ class MpvPlayerWidget(QWidget):
         try:
             idle = self._player.idle_active
             if idle:
-                if self._position != 0.0:
+                if self._file_has_played and self._position != 0.0:
                     self._position = 0.0
+                    self._file_has_played = False
                     self.state_changed.emit("stopped")
                     self.end_of_file.emit()
                 return
@@ -83,6 +85,7 @@ class MpvPlayerWidget(QWidget):
             duration = self._player.duration
             if duration is not None and duration != self._duration:
                 self._duration = duration
+                self._file_has_played = True
                 self.duration_changed.emit(duration)
                 self.file_loaded.emit()
 
@@ -133,6 +136,7 @@ class MpvPlayerWidget(QWidget):
         if self._player:
             self._last_in_sr = 0
             self._last_out_sr = 0
+            self._player.audio_files = []
             self._set_http_headers(http_headers)
             self._player.play(url)
 
@@ -144,6 +148,24 @@ class MpvPlayerWidget(QWidget):
             self._set_http_headers(http_headers)
             self._player.audio_files = [audio_url]
             self._player.play(video_url)
+
+    def play_live(self, url: str, http_headers: dict | None = None):
+        """Play a live stream with cache settings optimized for continuous streaming."""
+        if self._player:
+            self._last_in_sr = 0
+            self._last_out_sr = 0
+            self._player.audio_files = []
+            self._set_http_headers(http_headers)
+            self._player.cache = "yes"
+            self._player["demuxer-max-bytes"] = "150MiB"
+            self._player["demuxer-readahead-secs"] = 30
+            self._player.play(url)
+
+    def replace_live_stream(self, url: str, http_headers: dict | None = None):
+        """Replace the current live stream URL without interrupting playback."""
+        if self._player:
+            self._set_http_headers(http_headers)
+            self._player.play(url)
 
     def _set_http_headers(self, headers: dict | None):
         if not self._player:
@@ -196,6 +218,10 @@ class MpvPlayerWidget(QWidget):
         if self._player:
             return not self._player.pause and not self._player.idle_active
         return False
+
+    def set_audio_exclusive(self, exclusive: bool):
+        if self._player:
+            self._player.audio_exclusive = "yes" if exclusive else "no"
 
     def set_audio_device(self, device: str):
         if self._player:
@@ -286,3 +312,16 @@ class MpvPlayerWidget(QWidget):
         if self._player:
             self._player.terminate()
             self._player = None
+
+    def load_subtitle(self, path: str):
+        """Load an external SRT subtitle file and activate it."""
+        if self._player:
+            self._player.command("sub-add", path, "select")
+
+    def remove_subtitle(self):
+        """Remove all external subtitle tracks."""
+        if self._player:
+            try:
+                self._player.command("sub-remove")
+            except (RuntimeError, OSError):
+                pass

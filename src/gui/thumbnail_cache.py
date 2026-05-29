@@ -108,3 +108,7 @@ class ThumbnailCache(QObject):
         """Clear all cached thumbnails."""
         self._cache.clear()
         self._pending.clear()
+
+    def shutdown(self):
+        """Shutdown the thread pool (call on application exit)."""
+        self._pool.shutdown(wait=False)

@@ -14,6 +14,10 @@ DEFAULT_CONFIG = {
     "last_url": "",
     "thumbnail_mode": False,
     "thumbnail_size": 80,
+    "llm_providers": [],
+    "llm_default_provider": "",
+    "subtitle_language": "zh",
+    "subtitle_model": "openai/whisper-large-v3",
 }
 
 CONFIG_PATH = Path.home() / ".ventiplayer" / "config.json"

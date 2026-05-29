@@ -81,15 +81,21 @@ def main():
 
     # 1. FastWave checkpoint
     print("--- FastWave ---")
-    fw_ckpt = FASTWAVE_DIR / "fastwave_checkpoint.pt"
+    fw_ckpt = FASTWAVE_DIR / "checkpoint.pth"
     download_gdrive(FASTWAVE_GDRIVE_ID, fw_ckpt)
 
     # 2. AudioSR checkpoint
     print("\n--- AudioSR ---")
-    audiosr_ckpt = HF_CACHE / "models--haoheliu--audiosr_basic" / "pytorch_model.bin"
-    if audiosr_ckpt.exists():
-        print(f"[OK] AudioSR checkpoint: {audiosr_ckpt.stat().st_size / 1024 / 1024:.0f} MB")
-    else:
+    audiosr_repo = HF_CACHE / "models--haoheliu--audiosr_basic"
+    audiosr_snapshots = audiosr_repo / "snapshots"
+    audiosr_found = False
+    if audiosr_snapshots.exists():
+        for snap in audiosr_snapshots.iterdir():
+            if (snap / "pytorch_model.bin").exists():
+                audiosr_found = True
+                print(f"[OK] AudioSR checkpoint: {(snap / 'pytorch_model.bin').stat().st_size / 1024 / 1024:.0f} MB")
+                break
+    if not audiosr_found:
         print("[DOWNLOADING] AudioSR checkpoint...")
         download_file("haoheliu/audiosr_basic", "pytorch_model.bin")
 

@@ -129,6 +129,7 @@ class ContentBrowser(QWidget):
         # Pagination state
         self._pop_page = 1
         self._pop_bvids: set[str] = set()
+        self._rec_page = 1
         self._rec_bvids: set[str] = set()
         self._search_page = 1
         self._search_keyword = ""
@@ -336,7 +337,9 @@ class ContentBrowser(QWidget):
         return items
 
     def _on_tab_changed(self, index: int):
-        if index == 1 and self._pop_list.count() == 0:
+        if index == 0 and self._rec_list.count() == 0:
+            self._load_recommendations()
+        elif index == 1 and self._pop_list.count() == 0:
             self._load_popular()
         elif index == 2 and self._fav_list.count() == 0:
             self._load_favorites()
@@ -368,10 +371,12 @@ class ContentBrowser(QWidget):
     def _load_more_recommendations(self):
         """Load more recommendations (infinite scroll)."""
         self._rec_status.setText("加载中...")
+        self._rec_page += 1
+        page = self._rec_page
 
         def _worker():
             try:
-                items = self._api.get_popular()
+                items = self._api.get_popular(page=page)
             except Exception:
                 items = []
             self._deliver_results("rec_more", items)

@@ -261,6 +261,9 @@ class SyncManager:
 
         drift_ms = (audio_pos - video_pos) * 1000.0
 
+        target_speed = None
+        avg_drift = 0.0
+
         # Record drift reading for confirmation
         with self._lock:
             self._drift_history.append(drift_ms)
@@ -299,7 +302,7 @@ class SyncManager:
                 return
 
         # Apply speed correction outside lock
-        if self._correction_active and self._set_speed_fn:
+        if target_speed is not None and self._set_speed_fn:
             self._set_speed_fn(target_speed)
             logger.debug(f"Soft correction: avg_drift={avg_drift:.0f}ms, speed={target_speed:.3f}")
 

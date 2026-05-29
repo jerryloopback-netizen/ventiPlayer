@@ -342,9 +342,11 @@ class FastWaveModel:
 
     @torch.no_grad()
     def enhance(self, audio: np.ndarray, input_sr: int,
-                target_sr: int) -> np.ndarray:
+                target_sr: int, num_steps: int | None = None) -> np.ndarray:
         if self._model is None:
             raise RuntimeError("Model not loaded")
+
+        steps = num_steps if num_steps is not None else self._num_steps
 
         if audio.ndim > 1:
             audio = audio.mean(axis=0)
@@ -396,7 +398,7 @@ class FastWaveModel:
             chunk = audio_padded.unsqueeze(0)
             enhanced = edm_sampler(
                 self._model, chunk, band,
-                num_steps=self._num_steps, device=self._device
+                num_steps=steps, device=self._device
             ).squeeze(0)
             output = enhanced[:total_len]
             return output.cpu().numpy()
@@ -414,7 +416,7 @@ class FastWaveModel:
             chunk = audio_low[start:start + chunk_size].unsqueeze(0)
             enhanced = edm_sampler(
                 self._model, chunk, band,
-                num_steps=self._num_steps, device=self._device
+                num_steps=steps, device=self._device
             ).squeeze(0)
             output[start:start + chunk_size] += enhanced * window
             norm[start:start + chunk_size] += window

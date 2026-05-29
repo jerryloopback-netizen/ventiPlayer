@@ -3,7 +3,7 @@ from PySide6.QtWidgets import (
     QPushButton, QMenu, QApplication, QLabel, QFrame, QTabWidget,
 )
 from PySide6.QtCore import Qt, Signal, Slot, QSize
-from PySide6.QtGui import QFont, QAction, QPixmap, QIcon
+from PySide6.QtGui import QFont, QAction, QPixmap, QIcon, QPalette
 
 from src.core.playlist import PlaylistManager, PlayMode, VideoItem, HistoryManager
 from src.gui.thumbnail_cache import ThumbnailCache
@@ -141,16 +141,7 @@ class PlaylistPanel(QWidget):
             idx = self._list.item(i).data(Qt.ItemDataRole.UserRole)
             new_order.append(idx)
 
-        old_queue = list(self._playlist.queue)
-        current_item = self._playlist.current()
-
-        self._playlist._queue = [old_queue[i] for i in new_order]
-        if current_item:
-            for i, item in enumerate(self._playlist._queue):
-                if item is current_item:
-                    self._playlist._current_index = i
-                    break
-
+        self._playlist.reorder(new_order)
         self._refresh_list()
 
     def _show_context_menu(self, pos):
@@ -247,7 +238,7 @@ class PlaylistPanel(QWidget):
                 font.setBold(False)
                 item.setFont(font)
                 item.setBackground(Qt.GlobalColor.transparent)
-                item.setForeground(Qt.GlobalColor.black)
+                item.setData(Qt.ItemDataRole.ForegroundRole, None)
 
     # --- Thumbnail mode ---
 

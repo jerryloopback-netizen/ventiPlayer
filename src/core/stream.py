@@ -26,6 +26,7 @@ class StreamInfo:
     video_height: Optional[int] = None
     video_fps: Optional[float] = None
     cookie_failed: bool = False
+    is_live: bool = False
 
 
 @dataclass
@@ -214,6 +215,19 @@ class StreamResolver:
                         video_res = f"{video_w}×{video_h}"
                     elif video_h:
                         video_res = f"{video_h}p"
+                elif fmt.get("vcodec", "none") != "none" and fmt.get("acodec", "none") != "none":
+                    video_url = fmt["url"]
+                    audio_url = fmt["url"]
+                    video_w = fmt.get("width")
+                    video_h = fmt.get("height")
+                    video_fps = fmt.get("fps")
+                    audio_codec = fmt.get("acodec", "")
+                    audio_sr = fmt.get("asr")
+                    audio_br = fmt.get("abr")
+                    if video_w and video_h:
+                        video_res = f"{video_w}×{video_h}"
+                    elif video_h:
+                        video_res = f"{video_h}p"
                 elif fmt.get("acodec", "none") != "none":
                     audio_url = fmt["url"]
                     audio_codec = fmt.get("acodec", "")
@@ -251,6 +265,7 @@ class StreamResolver:
             video_width=video_w,
             video_height=video_h,
             video_fps=video_fps,
+            is_live=bool(info.get("is_live", False)),
         )
 
     def get_best_audio_url(self, url: str) -> str:
@@ -259,3 +274,19 @@ class StreamResolver:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
         return info.get("url", "")
+
+    def resolve_live_refresh(self, url: str, callback):
+        """Re-resolve a live stream URL in background for stream refresh.
+
+        callback receives StreamInfo on success, None on failure.
+        """
+        def _worker():
+            try:
+                stream_info = self.resolve(url)
+                callback(stream_info)
+            except Exception:
+                callback(None)
+
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+        return t

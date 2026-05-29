@@ -152,8 +152,8 @@ class Enhancer:
         """
         if self._fastwave is None:
             raise RuntimeError("FastWave model not loaded")
-        self._fastwave._num_steps = self._num_steps
-        return self._fastwave.enhance(audio, input_sr, self._target_sr)
+        return self._fastwave.enhance(audio, input_sr, self._target_sr,
+                                      num_steps=self._num_steps)
 
     def enhance_full(self, audio: np.ndarray, input_sr: int,
                      progress_callback=None) -> np.ndarray:
@@ -181,10 +181,5 @@ class Enhancer:
             ckpt = MODELS_DIR / "fastwave" / "checkpoint.pth"
             return ckpt.exists()
         else:
-            try:
-                from src.models.audiosr_model import _patch_torch_distributed
-                _patch_torch_distributed()
-                import audiosr  # noqa: F401
-                return True
-            except ImportError:
-                return False
+            import importlib.util
+            return importlib.util.find_spec("audiosr") is not None

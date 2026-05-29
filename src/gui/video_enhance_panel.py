@@ -657,7 +657,8 @@ class VideoEnhancePanel(QWidget):
     def _generate_cas_shader(self) -> str | None:
         if not _CAS_TEMPLATE.exists():
             return None
-        sharpness = self.get_cas_sharpness()
+        # CAS SHARPNESS param: 0=max sharpening, 1=none; invert from user-facing strength
+        sharpness = 1.0 - self.get_cas_sharpness()
         source = _CAS_TEMPLATE.read_text(encoding="utf-8")
         source = source.replace(
             "#define SHARPNESS 0.4",
@@ -749,4 +750,4 @@ class VideoEnhancePanel(QWidget):
         self.interpolation_changed.emit(False, {})
 
     def get_cas_sharpness(self) -> float:
-        return 1.0 - (self._sharpen_slider.value() / 10.0)
+        return self._sharpen_slider.value() / 10.0

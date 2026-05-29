@@ -35,10 +35,18 @@ os.environ["PATH"] = _project_root + os.pathsep + os.environ.get("PATH", "")
 
 os.environ.setdefault("QT_ENABLE_HIGHDPI_SCALING", "1")
 
-# ROCm MIOpen cache path (avoid non-ASCII username issues)
-os.environ.setdefault("MIOPEN_USER_DB_PATH", "C:/temp/miopen_cache")
-os.environ.setdefault("MIOPEN_CUSTOM_CACHE_DIR", "C:/temp/miopen_cache")
-os.makedirs("C:/temp/miopen_cache", exist_ok=True)
+# ROCm MIOpen 缓存路径：MIOpen 的 SQLite 缓存无法打开含非 ASCII 字符的路径
+# （本机用户名为中文，C:\Users\洛\... 会让 conv 等算子报 miopenStatusInternalError）。
+# tempfile.gettempdir() 通常落在 C:\Users\<用户名>\AppData\Local\Temp，仍含中文，
+# 因此优先用 ASCII 的项目根目录；万一项目根也非 ASCII，再退回系统临时目录。
+import tempfile as _tempfile
+_ascii_base = _project_root if _project_root.isascii() else _tempfile.gettempdir()
+_miopen_cache = str(Path(_ascii_base) / ".miopen_cache")
+# 用显式赋值而非 setdefault：start.bat 可能已经设过一个非 ASCII 的旧值，
+# 这里必须覆盖它，否则缓存路径仍然指向中文目录导致 GPU 算子失败。
+os.environ["MIOPEN_USER_DB_PATH"] = _miopen_cache
+os.environ["MIOPEN_CUSTOM_CACHE_DIR"] = _miopen_cache
+os.makedirs(_miopen_cache, exist_ok=True)
 
 # PyTorch memory management for 16GB VRAM
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")

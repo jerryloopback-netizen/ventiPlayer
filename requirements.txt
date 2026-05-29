@@ -8,3 +8,7 @@ torch>=2.4
 audiosr>=0.0.7
 av>=12.0
 soundfile>=0.12
+
+# Phase 7: Subtitle Generation
+transformers>=4.40
+httpx>=0.27

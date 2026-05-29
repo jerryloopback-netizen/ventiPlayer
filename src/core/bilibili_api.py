@@ -3,6 +3,7 @@
 import hashlib
 import time
 import re
+import threading
 import urllib.request
 import urllib.parse
 import json
@@ -63,6 +64,7 @@ class BilibiliAPI:
         self._img_key = ""
         self._sub_key = ""
         self._wbi_updated = 0.0  # timestamp of last WBI key fetch
+        self._wbi_lock = threading.Lock()
 
     def set_cookies_from_file(self, cookie_file: str):
         """Extract SESSDATA and buvid3 from a Netscape cookie file."""
@@ -96,22 +98,26 @@ class BilibiliAPI:
         if self._img_key and self._sub_key and (now - self._wbi_updated) < 3600:
             return
 
-        try:
-            data = self._request("/x/web-interface/nav", need_wbi=False)
-            if not data:
+        with self._wbi_lock:
+            # Double-check after acquiring lock
+            now = time.time()
+            if self._img_key and self._sub_key and (now - self._wbi_updated) < 3600:
                 return
-            wbi_img = data.get("wbi_img", {})
-            img_url = wbi_img.get("img_url", "")
-            sub_url = wbi_img.get("sub_url", "")
-            # Extract filename without extension from URL
-            # e.g. https://i0.hdslb.com/bfs/wbi/xxxx.png -> xxxx
-            if img_url:
-                self._img_key = img_url.rsplit("/", 1)[-1].split(".")[0]
-            if sub_url:
-                self._sub_key = sub_url.rsplit("/", 1)[-1].split(".")[0]
-            self._wbi_updated = now
-        except Exception as e:
-            logger.warning("Failed to fetch WBI keys: %s", e)
+
+            try:
+                data = self._request("/x/web-interface/nav", need_wbi=False)
+                if not data:
+                    return
+                wbi_img = data.get("wbi_img", {})
+                img_url = wbi_img.get("img_url", "")
+                sub_url = wbi_img.get("sub_url", "")
+                if img_url:
+                    self._img_key = img_url.rsplit("/", 1)[-1].split(".")[0]
+                if sub_url:
+                    self._sub_key = sub_url.rsplit("/", 1)[-1].split(".")[0]
+                self._wbi_updated = now
+            except Exception as e:
+                logger.warning("Failed to fetch WBI keys: %s", e)
 
     def _sign_wbi(self, params: dict) -> dict:
         """Add WBI signature (w_rid, wts) to params."""

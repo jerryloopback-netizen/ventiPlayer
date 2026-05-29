@@ -14,7 +14,7 @@ class VideoItem:
     title: str
     duration: Optional[float]
     thumbnail_url: str
-    source_type: str  # "bilibili", "youtube"
+    source_type: str  # "bilibili", "youtube", "twitch"
     url: str  # webpage URL
 
 
@@ -229,6 +229,17 @@ class PlaylistManager(QObject):
 
     def contains_url(self, url: str) -> bool:
         return any(item.url == url for item in self._queue)
+
+    def reorder(self, new_indices: list[int]):
+        """Reorder the queue according to new_indices (a permutation of current indices)."""
+        if sorted(new_indices) != list(range(len(self._queue))):
+            return
+        old_queue = self._queue
+        self._queue = [old_queue[i] for i in new_indices]
+        if 0 <= self._current_index < len(old_queue):
+            current_item = old_queue[self._current_index]
+            self._current_index = self._queue.index(current_item)
+        self.queue_changed.emit()
 
     def __len__(self) -> int:
         return len(self._queue)
