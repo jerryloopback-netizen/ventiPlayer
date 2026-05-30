@@ -18,6 +18,8 @@ DEFAULT_CONFIG = {
     "llm_default_provider": "",
     "subtitle_language": "zh",
     "subtitle_model": "openai/whisper-large-v3",
+    "lossless_scaling_path": "",
+    "lossless_scaling_hotkey": "ctrl+alt+s",
 }
 
 CONFIG_PATH = Path.home() / ".ventiplayer" / "config.json"

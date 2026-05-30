@@ -28,6 +28,8 @@ from src.core.bilibili_api import BilibiliAPI, BiliVideoInfo, BiliVideoItem
 from src.core.enhancer import Enhancer, EnhanceMode, Backend
 from src.core.audio_pipe import AudioPipeline, PipelineState, PipelineStatus
 from src.core.sync import SyncManager, SyncState, SyncStatus
+from src.core.frame_gen import FrameGenManager
+from src.core.lossless_scaling import LosslessScalingController
 from src.core.resource_monitor import ResourceMonitor
 from src.core.subtitle import SubtitlePipeline, SubtitleStatus, extract_video_id
 from src.core.llm import LLMProvider, provider_from_dict
@@ -96,6 +98,15 @@ class MainWindow(QMainWindow):
         # Sync manager
         self._sync = SyncManager()
         self._enhanced_playing = False  # True when enhanced audio is active
+
+        # Frame generation manager（仅做后端依赖检测：display-resample + 小黄鸭）
+        self._frame_gen_mgr = FrameGenManager()
+        # 小黄鸭 (Lossless Scaling) 外部全屏补帧控制器（懒启动，常驻）
+        self._ls_controller = LosslessScalingController(
+            self._settings.get("lossless_scaling_path") or "",
+            self._settings.get("lossless_scaling_hotkey") or "ctrl+alt+s",
+        )
+        self._ls_backend_selected = False
 
         # Live stream state
         self._is_live = False
@@ -217,7 +228,11 @@ class MainWindow(QMainWindow):
         video_tab = QWidget()
         video_layout = QVBoxLayout(video_tab)
         video_layout.setContentsMargins(4, 4, 4, 4)
-        self._video_enhance_panel = VideoEnhancePanel()
+        self._video_enhance_panel = VideoEnhancePanel(
+            frame_gen_caps=self._frame_gen_mgr.check_dependencies(
+                ls_exe_path=self._settings.get("lossless_scaling_path") or ""
+            )
+        )
         video_layout.addWidget(self._video_enhance_panel)
         video_layout.addStretch()
         self._right_tabs.addTab(video_tab, "视频")
@@ -337,10 +352,10 @@ class MainWindow(QMainWindow):
         self._upscale_indicator.setTextFormat(Qt.TextFormat.RichText)
         self._upscale_indicator.setStyleSheet("font-size: 11px; margin-left: 6px;")
         self._status_bar.addPermanentWidget(self._upscale_indicator)
-        self._interp_indicator = QLabel("")
-        self._interp_indicator.setTextFormat(Qt.TextFormat.RichText)
-        self._interp_indicator.setStyleSheet("font-size: 11px; margin-left: 6px;")
-        self._status_bar.addPermanentWidget(self._interp_indicator)
+        self._framegen_indicator = QLabel("")
+        self._framegen_indicator.setTextFormat(Qt.TextFormat.RichText)
+        self._framegen_indicator.setStyleSheet("font-size: 11px; margin-left: 6px;")
+        self._status_bar.addPermanentWidget(self._framegen_indicator)
         self._resource_label = QLabel("")
         self._resource_label.setStyleSheet(
             "font-family: Consolas, monospace; font-size: 11px; margin-left: 8px;"
@@ -358,7 +373,14 @@ class MainWindow(QMainWindow):
         self._video_out_fps: float = 0.0  # actual video output fps
         self._upscale_factor: int = 1  # 1 = no upscale, 2 = x2 shader active
         self._upscale_actually_active: bool = False  # True only when upscale shaders verified loaded
-        self._interpolation_active: bool = False  # True when display-resample interpolation is on
+        # 帧生成状态：backend(off|display-resample|lossless-scaling) / multiplier /
+        # target_fps(0=倍率模式) / applied(是否真正生效)
+        self._framegen_state: dict = {
+            "backend": "off",
+            "multiplier": 1.0,
+            "target_fps": 0,
+            "applied": False,
+        }
 
     def _setup_shortcuts(self):
         QShortcut(QKeySequence(Qt.Key.Key_Space), self, self._toggle_pause)
@@ -410,7 +432,7 @@ class MainWindow(QMainWindow):
         self._video_enhance_panel.vf_changed.connect(self._on_video_vf_changed)
         self._video_enhance_panel.hdr_changed.connect(self._on_video_hdr_changed)
         self._video_enhance_panel.upscale_factor_changed.connect(self._on_upscale_factor_changed)
-        self._video_enhance_panel.interpolation_changed.connect(self._on_interpolation_changed)
+        self._video_enhance_panel.frame_gen_changed.connect(self._on_frame_gen_changed)
         # Content browser signals
         self._content_browser.play_video.connect(self._on_browser_play)
         self._content_browser.play_video_with_context.connect(self._on_browser_play_with_context)
@@ -523,7 +545,17 @@ class MainWindow(QMainWindow):
         dlg.thumbnail_mode_changed.connect(self._on_thumbnail_mode_changed)
         dlg.thumbnail_size_changed.connect(self._on_thumbnail_size_changed)
         dlg.llm_config_changed.connect(self._on_llm_config_changed)
+        dlg.lossless_scaling_changed.connect(self._on_ls_settings_changed)
         dlg.exec()
+
+    @Slot()
+    def _on_ls_settings_changed(self):
+        """设置中小黄鸭路径/快捷键变更：更新控制器配置并刷新面板后端可选项。"""
+        path = self._settings.get("lossless_scaling_path") or ""
+        hotkey = self._settings.get("lossless_scaling_hotkey") or "ctrl+alt+s"
+        self._ls_controller.update_config(path, hotkey)
+        caps = self._frame_gen_mgr.check_dependencies(ls_exe_path=path)
+        self._video_enhance_panel.refresh_caps(caps)
 
     @Slot(str)
     def _on_cookie_imported_from_settings(self, path: str):
@@ -714,7 +746,7 @@ class MainWindow(QMainWindow):
         self._media_info_label.setText("")
         self._audio_source_indicator.setText("")
         self._upscale_indicator.setText("")
-        self._interp_indicator.setText("")
+        self._framegen_indicator.setText("")
         self._enhance_panel.set_enhance_enabled(False)
         # Reset live state
         self._is_live = False
@@ -755,31 +787,116 @@ class MainWindow(QMainWindow):
         self._update_media_info()
 
     @Slot(bool, dict)
-    def _on_interpolation_changed(self, enabled: bool, params: dict):
-        """Apply mpv interpolation (display-resample) settings."""
+    def _on_frame_gen_changed(self, enabled: bool, params: dict):
+        """帧生成总入口：按 backend 分流到 display-resample / 小黄鸭。
+
+        - display-resample：走 mpv property（零回归旧伪插帧行为）。
+        - lossless-scaling：外部小黄鸭程序，懒启动 + 全屏快捷键驱动，不接入 mpv vf 链。
+        - 关闭/切换前先复位伪插帧 property，并停掉小黄鸭缩放（进程保持常驻）。
+        """
         player = self._player_widget._player
         if not player:
             return
-        try:
-            if enabled:
-                tscale = params.get("tscale", "oversample")
-                threshold = params.get("threshold", -1)
-                player["video-sync"] = "display-resample"
-                player["interpolation"] = "yes"
-                player["tscale"] = tscale
-                if threshold == -1:
-                    player["interpolation-threshold"] = -1
-                else:
-                    player["interpolation-threshold"] = threshold / 10.0
-                self._interpolation_active = True
-            else:
-                player["video-sync"] = "audio"
-                player["interpolation"] = "no"
-                self._interpolation_active = False
-        except (RuntimeError, OSError) as e:
-            logger.warning("Failed to set interpolation: %s", e)
-            self._interpolation_active = False
+        backend = params.get("backend", "display-resample") if enabled else "off"
+
+        if not enabled or backend == "off":
+            self._teardown_frame_gen(player)
+            self._stop_ls_if_selected()
+            self._framegen_state = {"backend": "off", "multiplier": 1.0,
+                                    "target_fps": 0, "applied": False}
+            self._sync.set_frame_gen_active(False, 1.0)
+            self._update_media_info()
+            return
+
+        if backend == "display-resample":
+            self._stop_ls_if_selected()
+            self._apply_display_resample(player, params)
+            self._sync.set_frame_gen_active(False, 1.0)
+        elif backend == "lossless-scaling":
+            self._enable_lossless_scaling(params)
         self._update_media_info()
+
+    def _stop_ls_if_selected(self):
+        """切走/关闭帧生成时：若之前选中小黄鸭，停掉缩放（进程保持常驻）。"""
+        if self._ls_backend_selected:
+            self._ls_controller.stop_scaling()
+            self._ls_backend_selected = False
+
+    def _apply_display_resample(self, player, params: dict):
+        """旧伪插帧：display-resample + interpolation=yes + tscale + threshold。"""
+        try:
+            tscale = params.get("tscale", "oversample")
+            threshold = params.get("threshold", -1)
+            player["video-sync"] = "display-resample"
+            player["interpolation"] = "yes"
+            player["tscale"] = tscale
+            if threshold == -1:
+                player["interpolation-threshold"] = -1
+            else:
+                player["interpolation-threshold"] = threshold / 10.0
+            self._framegen_state = {"backend": "display-resample", "multiplier": 1.0,
+                                    "target_fps": 0, "applied": True}
+        except (RuntimeError, OSError) as e:
+            logger.warning("帧生成: 设置 display-resample 失败: %s", e)
+            self._framegen_state = {"backend": "display-resample", "multiplier": 1.0,
+                                    "target_fps": 0, "applied": False}
+
+    def _enable_lossless_scaling(self, params: dict):
+        """启用小黄鸭后端：懒启动外部程序；进入全屏后由快捷键驱动开启缩放。
+
+        小黄鸭是外部叠加程序，不接入 mpv vf，也不是 mpv interpolation，
+        故先复位 video-sync=audio + interpolation=no。
+        """
+        player = self._player_widget._player
+        if not self._ls_controller.is_configured() or not self._ls_controller.exe_exists():
+            QMessageBox.information(self, "小黄鸭", "请先在设置中配置 Lossless Scaling 路径")
+            # 回退到关闭状态（面板会因 caps 不可用回落到 display-resample）
+            self._framegen_state = {"backend": "off", "multiplier": 1.0,
+                                    "target_fps": 0, "applied": False}
+            self._sync.set_frame_gen_active(False, 1.0)
+            return
+        # 复位 mpv 伪插帧 property（小黄鸭不是 mpv interpolation）
+        if player:
+            try:
+                player["interpolation"] = "no"
+                player["video-sync"] = "audio"
+            except (RuntimeError, OSError):
+                pass
+        self._ls_controller.launch()
+        self._ls_backend_selected = True
+        # LS 启动后窗口会盖在播放器之上（且若以管理员运行还有 UAC 框）。给它点时间
+        # 建好窗口，再尽力最小化 LS（仅 LS 非提权时有效）并把播放器拉回前台。
+        QTimer.singleShot(800, self._tame_ls_window)
+        self._framegen_state = {"backend": "lossless-scaling", "multiplier": 1.0,
+                                "target_fps": 0, "applied": True}
+        self._sync.set_frame_gen_active(False, 1.0)
+        # 若已处于全屏，立即开启缩放
+        if getattr(self, "_is_fullscreen", False):
+            self._ls_controller.start_scaling()
+
+    def _tame_ls_window(self):
+        """LS 启动后：尽力最小化其窗口，并把 VentiPlayer 拉回前台。
+
+        最小化仅在 LS 非提权时有效（UIPI 限制，见 controller.minimize_window）；
+        无论是否成功，都把播放器窗口提到前台，确保用户视线回到播放器。
+        """
+        try:
+            self._ls_controller.minimize_window()
+        except Exception:
+            pass
+        try:
+            self.raise_()
+            self.activateWindow()
+        except Exception:
+            pass
+
+    def _teardown_frame_gen(self, player):
+        """关闭帧生成：仅复位伪插帧 property（不再有 vf 路径）。"""
+        try:
+            player["video-sync"] = "audio"
+            player["interpolation"] = "no"
+        except (RuntimeError, OSError) as e:
+            logger.debug("帧生成: 复位 video-sync 失败(可忽略): %s", e)
 
     def _update_media_info(self, *_args):
         """Rebuild the media info label: V-res-fps → out_res | A-sr-cutoff(→output) | exclusive"""
@@ -815,9 +932,13 @@ class MainWindow(QMainWindow):
             if fps_str:
                 v_info += f"-{fps_str}"
 
-            # Determine effective output FPS (display refresh rate if interpolation active)
+            # 计算有效输出帧率
             effective_out_fps = self._video_out_fps
-            if self._interpolation_active:
+            st = self._framegen_state
+            fg_applied = st.get("applied", False)
+            fg_backend = st.get("backend", "off")
+            if fg_backend == "display-resample" and fg_applied:
+                # 伪插帧：受显示刷新率约束，取 display-fps
                 try:
                     player = self._player_widget._player
                     display_fps = player["display-fps"] if player else None
@@ -825,11 +946,12 @@ class MainWindow(QMainWindow):
                         effective_out_fps = round(display_fps, 1)
                 except Exception:
                     pass
+            # 小黄鸭(lossless-scaling)是外部叠加补帧，mpv 仍只输出源帧，无需调整 effective_out_fps
 
             # Show output resolution: use upscale factor applied to video-out-params
             out_w = self._video_out_w * self._upscale_factor if self._video_out_w else 0
             out_h = self._video_out_h * self._upscale_factor if self._video_out_h else 0
-            show_arrow = (self._upscale_factor > 1 and out_w > 0 and out_h > 0) or self._interpolation_active
+            show_arrow = (self._upscale_factor > 1 and out_w > 0 and out_h > 0) or fg_applied
             if show_arrow:
                 if out_w == 0 or out_h == 0:
                     out_w = self._video_out_w or src_w
@@ -866,7 +988,7 @@ class MainWindow(QMainWindow):
         if not self._current_stream:
             self._audio_source_indicator.setText("")
             self._upscale_indicator.setText("")
-            self._interp_indicator.setText("")
+            self._framegen_indicator.setText("")
             return
         if self._enhanced_playing:
             self._audio_source_indicator.setText(
@@ -885,25 +1007,63 @@ class MainWindow(QMainWindow):
             self._upscale_indicator.setText(
                 '<span style="color: #9E9E9E; font-size: 14px;">●</span> 未超分'
             )
-        # Interpolation indicator — based on actual mpv video-sync state
-        if self._interpolation_active:
-            try:
-                player = self._player_widget._player
-                actual_sync = player["video-sync"] if player else None
-            except Exception:
-                actual_sync = None
-            if actual_sync == "display-resample":
-                self._interp_indicator.setText(
-                    '<span style="color: #4CAF50; font-size: 14px;">●</span> 伪插帧'
-                )
+        # Frame-gen indicator — 小黄鸭 / 伪插帧 / 源帧率
+        self._render_framegen_indicator()
+
+    def _render_framegen_indicator(self):
+        """状态栏帧生成指示器：按 backend/生效状态渲染。
+
+        - off               灰 源帧率
+        - display-resample  绿 伪插帧（注入即生效）
+        - lossless-scaling  绿 小黄鸭 生效（已发送快捷键开启缩放）/ 黄 小黄鸭 待全屏
+        """
+        st = self._framegen_state
+        backend = st.get("backend", "off")
+        if backend == "off":
+            self._framegen_indicator.setText(
+                '<span style="color:#9E9E9E;font-size:14px;">●</span> 源帧率')
+            return
+        if backend == "lossless-scaling":
+            if self._ls_controller.is_scaling:
+                self._framegen_indicator.setText(
+                    '<span style="color:#4CAF50;font-size:14px;">●</span> 小黄鸭 生效')
             else:
-                self._interp_indicator.setText(
-                    '<span style="color: #FF9800; font-size: 14px;">●</span> 伪插帧(异常)'
-                )
-        else:
-            self._interp_indicator.setText(
-                '<span style="color: #9E9E9E; font-size: 14px;">●</span> 源帧率'
-            )
+                self._framegen_indicator.setText(
+                    '<span style="color:#FFEB3B;font-size:14px;">●</span> 小黄鸭 待全屏')
+            return
+        applied = self._verify_framegen_applied(backend)
+        st["applied"] = applied
+        if not applied:
+            self._framegen_indicator.setText(
+                '<span style="color:#FF9800;font-size:14px;">●</span> 帧生成(异常)')
+            return
+        # display-resample：注入即视为生效（绿）
+        self._framegen_indicator.setText(
+            '<span style="color:#4CAF50;font-size:14px;">●</span> 伪插帧')
+
+    def _framegen_is_effective(self) -> bool:
+        """帧生成是否真正生效。
+
+        - lossless-scaling：以小黄鸭是否已开启缩放为准。
+        - display-resample：注入即生效（applied 已校验）。
+        """
+        if self._framegen_state.get("backend") == "lossless-scaling":
+            return self._ls_controller.is_scaling
+        return self._framegen_state.get("applied", False)
+
+    def _verify_framegen_applied(self, backend: str) -> bool:
+        """校验后端是否真正生效：伪插帧查 video-sync，小黄鸭看是否已选中。"""
+        if backend == "lossless-scaling":
+            return self._ls_backend_selected
+        try:
+            player = self._player_widget._player
+            if not player:
+                return False
+            if backend == "display-resample":
+                return player["video-sync"] == "display-resample"
+            return False
+        except Exception:
+            return False
 
     def _format_audio_info(self, stream: StreamInfo) -> str:
         """Format audio section: A-44.1kHz-16kHz → 48kHz-24kHz"""
@@ -1024,19 +1184,74 @@ class MainWindow(QMainWindow):
         self._right_tabs.hide()
         self.statusBar().hide()
         self.showFullScreen()
+        self._fs_start_autohide()
+        # 选中小黄鸭后端时，进入全屏后延迟发送快捷键开启缩放（等全屏画面稳定）
+        if self._ls_backend_selected and self._ls_controller.is_configured():
+            QTimer.singleShot(400, self._ls_controller.start_scaling)
 
     @Slot()
     def _exit_fullscreen(self):
         if not self._is_fullscreen:
             return
+        # 退出全屏前先关闭小黄鸭缩放（小黄鸭需全屏画面，退出即关）
+        if self._ls_controller.is_scaling:
+            self._ls_controller.stop_scaling()
         self._is_fullscreen = False
+        self._fs_stop_autohide()
         self._url_bar.show()
         self._right_tabs.show()
         self.statusBar().show()
+        self._transport_bar.show()  # 退出全屏务必恢复控制栏
+        self._fs_restore_cursor()
         if self._was_maximized:
             self.showMaximized()
         else:
             self.showNormal()
+
+    # --- 全屏悬浮控制栏：鼠标静止隐藏，移动唤出 ---
+
+    def _fs_start_autohide(self):
+        """进入全屏时启动自动隐藏。用轮询光标位置而非事件过滤——mpv 嵌入的原生子窗口
+        会吞掉鼠标事件，轮询 QCursor.pos() 才能可靠感知“视频区域上的鼠标移动”。"""
+        from PySide6.QtGui import QCursor
+        if not hasattr(self, "_fs_cursor_timer"):
+            self._fs_cursor_timer = QTimer(self)
+            self._fs_cursor_timer.setInterval(400)
+            self._fs_cursor_timer.timeout.connect(self._fs_tick)
+        self._fs_last_pos = QCursor.pos()
+        self._fs_idle_ms = 0
+        self._transport_bar.show()
+        self._fs_cursor_timer.start()
+
+    def _fs_stop_autohide(self):
+        if hasattr(self, "_fs_cursor_timer"):
+            self._fs_cursor_timer.stop()
+
+    @Slot()
+    def _fs_tick(self):
+        if not self._is_fullscreen:
+            self._fs_cursor_timer.stop()
+            return
+        from PySide6.QtGui import QCursor
+        pos = QCursor.pos()
+        if pos != self._fs_last_pos:
+            # 鼠标移动了：唤出控制栏 + 恢复光标，重置静止计时
+            self._fs_last_pos = pos
+            self._fs_idle_ms = 0
+            if not self._transport_bar.isVisible():
+                self._transport_bar.show()
+            self._fs_restore_cursor()
+        else:
+            self._fs_idle_ms += self._fs_cursor_timer.interval()
+            if self._fs_idle_ms >= 2400 and self._transport_bar.isVisible():
+                # 静止 2.4s：隐藏控制栏并隐藏光标
+                self._transport_bar.hide()
+                self.setCursor(Qt.CursorShape.BlankCursor)
+                self._player_widget.setCursor(Qt.CursorShape.BlankCursor)
+
+    def _fs_restore_cursor(self):
+        self.unsetCursor()
+        self._player_widget.unsetCursor()
 
     def _seek_relative(self, seconds: float):
         if self._player_widget.duration > 0:
@@ -1159,6 +1374,11 @@ class MainWindow(QMainWindow):
         self._pipeline.cleanup()
         self._enhancer.unload()
         self._thumbnail_cache.shutdown()
+        # 退出时务必终止小黄鸭进程（已确认接受可能误杀用户自开实例）
+        try:
+            self._ls_controller.terminate()
+        except Exception:
+            pass
         self._player_widget.destroy()
         event.accept()
 
@@ -1463,6 +1683,10 @@ class MainWindow(QMainWindow):
         """Update the resource usage label in the status bar."""
         text = self._resource_monitor.format_stats()
         self._resource_label.setText(text)
+        # 小黄鸭启用时周期性刷新帧生成指示器，使其在进入/退出全屏后
+        # 自动在“待全屏(黄)”与“生效(绿)”之间切换，无需用户操作。
+        if self._framegen_state.get("backend", "off") == "lossless-scaling":
+            self._render_framegen_indicator()
 
     # --- Enhancement integration ---
 
@@ -1733,15 +1957,23 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _on_video_vf_changed(self, vf_str: str):
-        """Apply video filter (denoise) to mpv."""
+        """应用降噪 vf（hqdn3d/nlmeans）。小黄鸭是外部叠加程序、不接入 mpv vf 链，
+        故降噪独占 mpv vf 链（二者可同时开启）。
+
+        hqdn3d/nlmeans 是 lavfi(CPU) 滤镜，需要 CPU 可读帧；硬解 d3d11 帧喂不进去会被
+        mpv 禁用（日志 'Impossible to convert ... d3d11'）。故启用降噪时切 auto-copy，
+        关闭时恢复 auto-safe。
+        """
         player = self._player_widget._player
         if not player:
             return
         try:
             if vf_str:
+                self._player_widget.set_hwdec_for_vf(True)  # 降噪需 CPU 可读帧
                 player.command("vf", "set", vf_str)
             else:
-                player.command("vf", "clr", "")
+                player.command("vf", "set", "")
+                self._player_widget.set_hwdec_for_vf(False)  # 无 CPU 滤镜，恢复零拷贝
         except (RuntimeError, OSError):
             pass
 

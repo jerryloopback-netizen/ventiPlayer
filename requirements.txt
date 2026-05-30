@@ -12,3 +12,10 @@ soundfile>=0.12
 # Phase 7: Subtitle Generation
 transformers>=4.40
 httpx>=0.27
+
+# Phase 6: 视频帧生成
+# - display-resample 伪插帧：mpv 内置，无需任何额外依赖。
+# - 小黄鸭 (Lossless Scaling) 全屏补帧：外部 Windows 程序（Steam 付费应用），不通过 pip 安装。
+#   在设置中填写 LosslessScaling.exe 的绝对路径即可；VentiPlayer 通过其全局快捷键驱动。
+#   早期内置的 SVP(svpflow)/RIFE(vsrife/vapoursynth) 真补帧后端已移除，相关依赖不再需要。
+

@@ -96,11 +96,18 @@ class VideoEnhancePanel(QWidget):
     vf_changed = Signal(str)
     hdr_changed = Signal(bool, dict)
     upscale_factor_changed = Signal(int)  # 1 = off, 2 = x2, 4 = x4
-    interpolation_changed = Signal(bool, dict)  # (enabled, {video_sync, tscale, threshold})
+    frame_gen_changed = Signal(bool, dict)  # (enabled, {backend, tscale, threshold})
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, frame_gen_caps: dict | None = None):
         super().__init__(parent)
+        # 帧生成依赖能力（由 main_window 传入 FrameGenManager.check_dependencies() 结果）。
+        # 缺省给一个小黄鸭不可用的安全值，仅 display-resample 可用。
+        self._fg_caps = frame_gen_caps or {
+            "display_resample": True,
+            "lossless_scaling": {"available": False, "reason": "", "exe_path": ""},
+        }
         self._setup_ui()
+        self._refresh_dep_hint()
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
@@ -407,16 +414,43 @@ class VideoEnhancePanel(QWidget):
         right_col.addWidget(self._upscale_widget)
         self._upscale_widget.setEnabled(False)
 
-        # --- Frame Interpolation (mpv built-in) ---
-        self._enable_interp = QCheckBox("伪插帧 (display-resample)")
-        self._enable_interp.toggled.connect(self._on_interp_toggled)
-        right_col.addWidget(self._enable_interp)
+        # --- Frame Generation (display-resample / 小黄鸭) ---
+        self._enable_fg = QCheckBox("帧生成 / 插帧")
+        self._enable_fg.toggled.connect(self._on_fg_toggled)
+        right_col.addWidget(self._enable_fg)
 
-        self._interp_widget = QWidget()
-        interp_layout = QVBoxLayout(self._interp_widget)
-        interp_layout.setContentsMargins(16, 0, 0, 0)
-        interp_layout.setSpacing(2)
+        self._fg_widget = QWidget()
+        fg_layout = QVBoxLayout(self._fg_widget)
+        fg_layout.setContentsMargins(16, 0, 0, 0)
+        fg_layout.setSpacing(2)
 
+        # backend 下拉：display-resample 伪插帧（恒可用） + 小黄鸭外部全屏补帧。
+        row_backend = QHBoxLayout()
+        row_backend.addWidget(QLabel("后端:"))
+        self._fg_backend = QComboBox()
+        self._fg_backend.addItems([
+            "display-resample (伪插帧)",            # idx 0（默认，恒可用）
+            "小黄鸭 (Lossless Scaling 全屏补帧)",   # idx 1
+        ])
+        self._fg_backend.currentIndexChanged.connect(self._on_fg_backend_changed)
+        row_backend.addWidget(self._fg_backend, 1)
+        fg_layout.addLayout(row_backend)
+
+        # 依赖缺失提示（默认隐藏）
+        self._fg_dep_hint = QLabel("")
+        self._fg_dep_hint.setStyleSheet("color: #d08770; font-size: 10px;")
+        self._fg_dep_hint.setWordWrap(True)
+        self._fg_dep_hint.setVisible(False)
+        fg_layout.addWidget(self._fg_dep_hint)
+
+        # 参数页堆栈：page0=display-resample，page1=小黄鸭说明页
+        self._fg_params_stack = QStackedWidget()
+
+        # page0: display-resample（沿用旧 tscale + threshold 控件）
+        page_dr = QWidget()
+        dr = QVBoxLayout(page_dr)
+        dr.setContentsMargins(0, 0, 0, 0)
+        dr.setSpacing(2)
         row_tscale = QHBoxLayout()
         row_tscale.addWidget(QLabel("算法:"))
         self._tscale_algo = QComboBox()
@@ -425,15 +459,13 @@ class VideoEnhancePanel(QWidget):
             "gaussian", "bicubic", "sphinx",
         ])
         self._tscale_algo.setCurrentIndex(0)
-        self._tscale_algo.currentIndexChanged.connect(self._on_interp_params_changed)
+        self._tscale_algo.currentIndexChanged.connect(self._on_fg_params_changed)
         row_tscale.addWidget(self._tscale_algo, 1)
-        interp_layout.addLayout(row_tscale)
-
+        dr.addLayout(row_tscale)
         self._tscale_desc = QLabel("最近邻，无混合，保持锐利")
         self._tscale_desc.setStyleSheet("color: gray; font-size: 10px;")
         self._tscale_desc.setContentsMargins(0, 0, 0, 0)
-        interp_layout.addWidget(self._tscale_desc)
-
+        dr.addWidget(self._tscale_desc)
         row_threshold = QHBoxLayout()
         row_threshold.addWidget(QLabel("阈值:"))
         self._interp_threshold = QSlider(Qt.Orientation.Horizontal)
@@ -444,18 +476,39 @@ class VideoEnhancePanel(QWidget):
         self._interp_threshold_val.setAlignment(
             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
         )
-        self._interp_threshold.valueChanged.connect(self._on_interp_params_changed)
+        self._interp_threshold.valueChanged.connect(self._on_fg_params_changed)
         row_threshold.addWidget(self._interp_threshold, 1)
         row_threshold.addWidget(self._interp_threshold_val)
-        interp_layout.addLayout(row_threshold)
-
+        dr.addLayout(row_threshold)
         self._interp_threshold_desc = QLabel("-1 = 始终插值")
         self._interp_threshold_desc.setStyleSheet("color: gray; font-size: 10px;")
         self._interp_threshold_desc.setContentsMargins(0, 0, 0, 0)
-        interp_layout.addWidget(self._interp_threshold_desc)
+        dr.addWidget(self._interp_threshold_desc)
+        self._fg_params_stack.addWidget(page_dr)  # index 0
 
-        right_col.addWidget(self._interp_widget)
-        self._interp_widget.setEnabled(False)
+        # page1: 小黄鸭（外部全屏补帧，仅说明文案，无可调参数）
+        page_ls = QWidget()
+        ls = QVBoxLayout(page_ls)
+        ls.setContentsMargins(0, 0, 0, 0)
+        ls.setSpacing(2)
+        ls_info1 = QLabel("需在「设置」中配置 Lossless Scaling 程序路径")
+        ls_info1.setStyleSheet("color: gray; font-size: 10px;")
+        ls_info1.setWordWrap(True)
+        ls.addWidget(ls_info1)
+        ls_info2 = QLabel("进入全屏自动开启缩放，退出全屏自动关闭")
+        ls_info2.setStyleSheet("color: gray; font-size: 10px;")
+        ls_info2.setWordWrap(True)
+        ls.addWidget(ls_info2)
+        ls_info3 = QLabel("快捷键在设置中配置")
+        ls_info3.setStyleSheet("color: gray; font-size: 10px;")
+        ls_info3.setWordWrap(True)
+        ls.addWidget(ls_info3)
+        self._fg_params_stack.addWidget(page_ls)  # index 1
+
+        fg_layout.addWidget(self._fg_params_stack)
+        right_col.addWidget(self._fg_widget)
+        self._fg_widget.setEnabled(False)
+        self._fg_params_stack.setCurrentIndex(0)  # 默认 display-resample 页
 
         right_col.addStretch()
 
@@ -498,6 +551,7 @@ class VideoEnhancePanel(QWidget):
 
     def _on_denoise_toggled(self, checked: bool):
         self._denoise_widget.setEnabled(checked)
+        # 降噪与小黄鸭可同时开启（小黄鸭是外部叠加程序，不占用 mpv vf 链）。
         self._emit_vf()
 
     def _on_hdr_toggled(self, checked: bool):
@@ -531,11 +585,30 @@ class VideoEnhancePanel(QWidget):
         if self._enable_upscale.isChecked():
             self._emit_all_shaders()
 
-    def _on_interp_toggled(self, checked: bool):
-        self._interp_widget.setEnabled(checked)
-        self._emit_interpolation()
+    def _on_fg_toggled(self, checked: bool):
+        self._fg_widget.setEnabled(checked)
+        # 降噪与小黄鸭可同时开启，不再互斥。
+        if checked:
+            self._refresh_dep_hint()
+            self._emit_frame_gen()
+        else:
+            self.frame_gen_changed.emit(False, {})
 
-    def _on_interp_params_changed(self, *_args):
+    def _on_fg_backend_changed(self, idx: int):
+        # 0 -> display-resample 页(0); 1 -> 小黄鸭说明页(1)
+        self._fg_params_stack.setCurrentIndex(1 if idx == 1 else 0)
+        self._refresh_dep_hint()
+        self._update_fg_descs()
+        if self._enable_fg.isChecked():
+            self._emit_frame_gen()
+
+    def _on_fg_params_changed(self, *_args):
+        self._update_fg_descs()
+        if self._enable_fg.isChecked():
+            self._emit_frame_gen()
+
+    def _update_fg_descs(self):
+        """同步 display-resample 页的 tscale_desc / threshold 文案。"""
         tscale = self._tscale_algo.currentText()
         self._tscale_desc.setText(_TSCALE_DESC.get(tscale, ""))
         threshold = self._interp_threshold.value()
@@ -546,16 +619,49 @@ class VideoEnhancePanel(QWidget):
             self._interp_threshold_desc.setText("0 = 仅帧率差距大时插值")
         else:
             self._interp_threshold_desc.setText(f"帧率差>{threshold}x时插值")
-        if self._enable_interp.isChecked():
-            self._emit_interpolation()
 
-    def _emit_interpolation(self):
-        enabled = self._enable_interp.isChecked()
-        params = {
-            "tscale": self._tscale_algo.currentText(),
-            "threshold": self._interp_threshold.value(),
-        }
-        self.interpolation_changed.emit(enabled, params)
+    def _refresh_dep_hint(self):
+        """根据依赖能力灰显小黄鸭项，并显示原因提示。"""
+        caps = self._fg_caps
+        ls_ok = caps.get("lossless_scaling", {}).get("available", False)
+        model = self._fg_backend.model()
+        self._set_item_enabled(model, 1, ls_ok)   # 小黄鸭
+
+        # 若当前选中小黄鸭但不可用，回落到 display-resample(idx0)
+        bidx = self._fg_backend.currentIndex()
+        if bidx == 1 and not ls_ok:
+            self._fg_backend.setCurrentIndex(0)
+            bidx = 0
+
+        if not ls_ok:
+            reason = caps.get("lossless_scaling", {}).get("reason") or "依赖未就绪"
+            self._fg_dep_hint.setText(f"小黄鸭不可用：{reason}")
+            self._fg_dep_hint.setVisible(True)
+        else:
+            self._fg_dep_hint.setVisible(False)
+
+    @staticmethod
+    def _set_item_enabled(combo_model, row: int, enabled: bool):
+        """把 QComboBox 底层 model 的某一项置灰/恢复。"""
+        item = combo_model.item(row)
+        if item is not None:
+            item.setEnabled(enabled)
+
+    _BACKEND_KEY = {0: "display-resample", 1: "lossless-scaling"}
+
+    def _emit_frame_gen(self):
+        enabled = self._enable_fg.isChecked()
+        bidx = self._fg_backend.currentIndex()
+        backend = self._BACKEND_KEY.get(bidx, "display-resample")
+        if backend == "lossless-scaling":
+            params = {"backend": "lossless-scaling"}
+        else:
+            params = {
+                "backend":   "display-resample",
+                "tscale":    self._tscale_algo.currentText(),
+                "threshold": self._interp_threshold.value(),
+            }
+        self.frame_gen_changed.emit(enabled, params)
 
     def _emit_all_shaders(self, *_args):
         """Combine CAS + super-resolution shaders into a single list."""
@@ -739,15 +845,28 @@ class VideoEnhancePanel(QWidget):
         self._anime4k_quality.setCurrentIndex(1)  # default 均衡
         self._fsr_sharpness.setValue(2)
         self._fsr_denoise.setChecked(True)
-        self._enable_interp.setChecked(False)
+        self._enable_fg.setChecked(False)
+        self._fg_backend.setCurrentIndex(0)        # 默认 display-resample
+        self._fg_params_stack.setCurrentIndex(0)
         self._tscale_algo.setCurrentIndex(0)
         self._interp_threshold.setValue(-1)
+        self._refresh_dep_hint()
         self.shader_changed.emit([])
         self.deband_changed.emit(False, {})
         self.vf_changed.emit("")
         self.hdr_changed.emit(False, {})
         self.upscale_factor_changed.emit(1)
-        self.interpolation_changed.emit(False, {})
+        self.frame_gen_changed.emit(False, {})
+
+    def set_frame_gen_caps(self, caps: dict):
+        """更新帧生成依赖能力并刷新后端可选项（供 main_window 在异步检测后调用）。"""
+        if caps:
+            self._fg_caps = caps
+            self._refresh_dep_hint()
+
+    def refresh_caps(self, caps: dict):
+        """设置变更后由 main_window 调用，更新依赖能力并刷新后端可选项。"""
+        self.set_frame_gen_caps(caps)
 
     def get_cas_sharpness(self) -> float:
         return self._sharpen_slider.value() / 10.0

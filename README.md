@@ -58,7 +58,7 @@
 | 5 — 视频增强 | CAS / Deband / Denoise / HDR / 超分辨率 (Anime4K, FSR, FSRCNNX) | ✅ 完成 |
 | 5.5 — B站直播 | live.bilibili.com 直播播放 + 视频增强 + 流刷新/重连 | ✅ 完成 |
 | 5.6 — Twitch | VOD 回放 + 直播，剪贴板自动识别，通用直播路径 | ✅ 完成 |
-| 6 — 视频插帧 | mpv interpolation (video-sync=display-resample + tscale) | ✅ 完成 |
+| 6 — 视频插帧 | display-resample 伪插帧 + 小黄鸭 (Lossless Scaling) 外部全屏补帧 | ✅ 完成 |
 | 7 — 字幕生成 | Whisper ASR + LLM 润色 → SRT，挂载到播放器 | ✅ 完成 |
 
 实测目标硬件：
@@ -167,16 +167,27 @@
 - Anime4K 质量档（快速 S → 均衡 M → 质量 L → 极致 VL → 极限 UL）对应不同 shader 链长度，越高越慢
 - FSR 和 CAS 均采用模板生成模式：运行时将参数写入 `*_active.glsl`，mpv 加载生成后的 shader（CAS 面板强度 0–10 映射为 shader 的 `SHARPNESS`，0 = 不锐化、10 = 最强）
 
-### 视频插帧
+### 视频插帧 / 帧生成
 
-基于 mpv 内置 interpolation 实现帧率提升：启用后设 `video-sync=display-resample` + `tscale`（默认 oversample），按显示器刷新率重采样时间轴。状态栏据 mpv 实际 `video-sync` 状态显示插帧是否真正生效。
+帧生成面板提供「后端下拉」统一入口，二选一（默认 **display-resample 伪插帧**）：
+
+| 后端 | 实现 | 说明 |
+|---|---|---|
+| **display-resample (伪插帧)** | mpv 内置 interpolation | 启用后设 `video-sync=display-resample` + `tscale`（默认 oversample），按显示器刷新率重采样时间轴。零依赖、零额外算力、始终可用。不是真正补帧，但能消除帧率与刷新率不匹配的微抖动，是日常推荐档。 |
+| **小黄鸭 (Lossless Scaling 全屏补帧)** | 外部程序 [Lossless Scaling](https://store.steampowered.com/app/993090/) 的 LSFG（最新 LSFG 3.1） | 调用外部小黄鸭程序对**全屏画面**做神经光流补帧，与 AMD AFMF 同思路，平滑度明显优于块匹配类算法。需在设置中填写 `LosslessScaling.exe` 路径；选中后由 VentiPlayer 懒启动该程序，**进入全屏自动开启缩放、退出全屏自动关闭**（通过向其发送全局快捷键，默认 `Ctrl+Alt+S`，须与小黄鸭内设置一致）。 |
+
+为什么不再内置 SVP / RIFE：早期版本曾内置 SVP（svpflow 块匹配，4K 可实时但平滑感不足且带 DRM 红框）与 PyTorch RIFE（神经光流画质好但 4K 非实时），实测体验均不达预期，已全部移除。现方案分工明确——伪插帧用于零成本消抖，真·补帧交给成熟的外部工具小黄鸭（其 LSFG 在画质与性能上均优于此前的内置方案）。
+
+小黄鸭工作机制：它通过屏幕捕获（DXGI/WGC）对全屏窗口做补帧并叠加输出，因此**只对无边框/窗口化全屏生效**（这也是触发点选在进/退全屏的原因），且会连同字幕/UI 一起插帧。延迟略高，但对被动看视频无影响。VentiPlayer 退出时会自动结束小黄鸭进程。
+
+> 注意：若 `LosslessScaling.exe` 设为「以管理员身份运行」（默认会弹 UAC 确认框），由于 Windows UIPI 限制，VentiPlayer 无法自动最小化其窗口；启动后程序会尽力最小化 LS 并把播放器拉回前台，但若仍盖在上方，可在 LS 属性→兼容性中关闭「以管理员身份运行」即可彻底解决。未配置路径或启动失败时，「小黄鸭」选项自动灰显并退回 display-resample。
 
 ### 面板布局
 
 视频增强面板采用双栏布局：
 
 - **左栏**：基础画面调整、CAS 锐化、去色带、降噪、HDR 色调映射
-- **右栏**：超分辨率、视频插帧
+- **右栏**：超分辨率、AI 帧生成 / 插帧
 
 ### 状态栏指示
 
@@ -186,7 +197,7 @@
 |---|---|---|
 | 升频 | 音频 AI 增强已激活 | 播放源音频 |
 | 超分 | 视频超分 shader 已加载 | 未启用超分 |
-| 插帧 | mpv display-resample 插帧已生效 | 未启用插帧 |
+| 帧生成 | 伪插帧已生效，或小黄鸭已开启缩放（`小黄鸭 生效`）；小黄鸭已选中但未进全屏时显示黄色（`小黄鸭 待全屏`） | 未启用（源帧率）|
 
 视频信息格式：`V-1920×1080-24fps → 3840×2160-24fps`（源分辨率 → 超分后输出分辨率）
 
@@ -330,7 +341,13 @@ mpv 嵌入组件。
 音频增强面板。模式切换（FastWave 实时 / AudioSR 精听）、输出采样率（44.1/48/96/192 kHz，默认 48 kHz native）、FastWave 采样步数（2–16，默认 4）/ AudioSR DDIM 步数（10–100，默认 50）。内置带「已增强长度」标记的进度条，让用户直观看到流式增强追到哪一秒。源采样率 ≥ 48 kHz 时自动禁用增强（无带宽缺失可修复）。
 
 ### `src/gui/video_enhance_panel.py`
-视频增强面板（双栏）。基础画面调整、CAS 锐化、去色带、降噪、HDR 色调映射、超分辨率（Anime4K / FSR / FSRCNNX）、视频插帧。FSR / CAS 用运行时模板生成 `*_active.glsl`。`get_cas_sharpness()` 返回滑块值 /10（0.0–1.0），写入 shader 前再取 `1 - x` 反转（shader 中 0 = 最强锐化）。
+视频增强面板（双栏）。基础画面调整、CAS 锐化、去色带、降噪、HDR 色调映射、超分辨率（Anime4K / FSR / FSRCNNX）、视频帧生成（display-resample 伪插帧 / 小黄鸭外部全屏补帧）。FSR / CAS 用运行时模板生成 `*_active.glsl`。`get_cas_sharpness()` 返回滑块值 /10（0.0–1.0），写入 shader 前再取 `1 - x` 反转（shader 中 0 = 最强锐化）。
+
+### `src/core/frame_gen.py`
+帧生成后端依赖检测。返回 display-resample（始终可用）与小黄鸭（`detect_lossless_scaling()` 静态校验 `LosslessScaling.exe` 路径是否存在）的可用性，供面板灰显不可用项。不直接执行补帧——伪插帧走 mpv 属性，小黄鸭由外部程序完成。
+
+### `src/core/lossless_scaling.py`
+小黄鸭（Lossless Scaling）外部程序控制器，不依赖 Qt（便于单测）。负责懒启动 `LosslessScaling.exe`、通过 Win32 `keybd_event` 发送全局缩放快捷键（解析 `ctrl+alt+s` 之类组合为 VK 序列、按下后逆序释放）、维护 `_scaling` 状态去重发送、尽力最小化 LS 窗口（受 UIPI 限制，仅 LS 非提权时有效）、退出时 `taskkill` 兜底结束所有实例。
 
 ### `src/gui/content_browser.py`
 内容浏览器（推荐 / 热门 / 收藏 三个标签）。切到空标签时自动加载对应内容；从浏览器播放时带上下文（兄弟视频）构建播放列表。
@@ -506,6 +523,16 @@ VentiPlayer/
 
 > `cookies/` 目录已在 `.gitignore` 中，不会上传。
 
+### 7. （可选）启用小黄鸭全屏补帧
+
+想用真·补帧（而非零成本的 display-resample 伪插帧）时：
+
+- 安装 [Lossless Scaling](https://store.steampowered.com/app/993090/)（Steam 付费应用，俗称「小黄鸭」）
+- 在小黄鸭中把缩放类型设为 **LSFG**（帧生成），并记下其「缩放开关」全局快捷键
+- 在 VentiPlayer 设置 →「帧生成 / 小黄鸭」里填写 `LosslessScaling.exe` 的绝对路径，并把快捷键填成与小黄鸭内一致（默认 `Ctrl+Alt+S`）
+- 之后在视频增强面板的帧生成下拉选「小黄鸭」，进入全屏即自动开始补帧、退出全屏自动停止
+- 建议在 `LosslessScaling.exe` 属性→兼容性里**关闭「以管理员身份运行」**，否则会弹 UAC 框、且其窗口因 Windows UIPI 限制无法被自动最小化
+
 ---
 
 ## 运行
@@ -553,7 +580,7 @@ VentiPlayer/
 ├── src/
 │   ├── main.py
 │   ├── gui/{main_window,player_widget,enhance_panel,video_enhance_panel,content_browser,playlist_panel,settings_dialog,thumbnail_cache}.py
-│   ├── core/{stream,audio_pipe,enhancer,sync,playlist,bilibili_api,subtitle,asr_engine,llm,resource_monitor}.py
+│   ├── core/{stream,audio_pipe,enhancer,sync,playlist,bilibili_api,subtitle,asr_engine,llm,resource_monitor,frame_gen,lossless_scaling}.py
 │   ├── models/{fastwave,audiosr_model}.py
 │   └── config/settings.py
 │

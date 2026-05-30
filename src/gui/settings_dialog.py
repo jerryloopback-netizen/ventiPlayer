@@ -20,6 +20,7 @@ class SettingsDialog(QDialog):
     thumbnail_mode_changed = Signal(bool)
     thumbnail_size_changed = Signal(int)
     llm_config_changed = Signal()
+    lossless_scaling_changed = Signal()
     _llm_test_done = Signal(bool, str)
     _model_download_done = Signal(bool, str)
 
@@ -177,6 +178,43 @@ class SettingsDialog(QDialog):
         asr_layout.addWidget(self._asr_info_label)
 
         layout.addWidget(asr_group)
+
+        # --- 帧生成 / 小黄鸭 (Lossless Scaling) section ---
+        ls_group = QGroupBox("帧生成 / 小黄鸭 (Lossless Scaling)")
+        ls_layout = QVBoxLayout(ls_group)
+
+        ls_path_row = QHBoxLayout()
+        ls_path_row.setSpacing(6)
+        ls_path_row.addWidget(QLabel("程序路径:"))
+        ls_path = self._settings.get("lossless_scaling_path") or ""
+        self._ls_path_edit = QLineEdit(ls_path)
+        self._ls_path_edit.setReadOnly(True)
+        self._ls_path_edit.setPlaceholderText("选择 LosslessScaling.exe")
+        ls_path_row.addWidget(self._ls_path_edit, 1)
+        self._ls_browse_btn = QPushButton("浏览...")
+        self._ls_browse_btn.clicked.connect(self._on_ls_browse)
+        ls_path_row.addWidget(self._ls_browse_btn)
+        ls_layout.addLayout(ls_path_row)
+
+        self._ls_status_label = QLabel("")
+        ls_layout.addWidget(self._ls_status_label)
+        self._update_ls_status(ls_path)
+
+        ls_hotkey_row = QHBoxLayout()
+        ls_hotkey_row.setSpacing(6)
+        ls_hotkey_row.addWidget(QLabel("缩放快捷键:"))
+        self._ls_hotkey_edit = QLineEdit(self._settings.get("lossless_scaling_hotkey") or "ctrl+alt+s")
+        self._ls_hotkey_edit.setPlaceholderText("ctrl+alt+s")
+        self._ls_hotkey_edit.editingFinished.connect(self._on_ls_hotkey_changed)
+        ls_hotkey_row.addWidget(self._ls_hotkey_edit, 1)
+        ls_layout.addLayout(ls_hotkey_row)
+
+        ls_help_label = QLabel("须与 Lossless Scaling 内设置的缩放快捷键一致")
+        ls_help_label.setStyleSheet("color: gray; font-size: 11px;")
+        ls_help_label.setWordWrap(True)
+        ls_layout.addWidget(ls_help_label)
+
+        layout.addWidget(ls_group)
 
         # --- Close button ---
         close_row = QHBoxLayout()
@@ -462,3 +500,36 @@ class SettingsDialog(QDialog):
         else:
             self._asr_info_label.setText(msg)
             QMessageBox.warning(self, "下载失败", msg)
+
+    # --- Lossless Scaling handlers ---
+
+    def _update_ls_status(self, path: str):
+        """刷新小黄鸭路径状态标签：绿=已配置且存在 / 灰=未配置 / 红=路径无效。"""
+        if not path:
+            self._ls_status_label.setText("未配置")
+            self._ls_status_label.setStyleSheet("color: gray;")
+            return
+        p = Path(path)
+        if p.is_file() and p.name.lower() == "losslessscaling.exe":
+            self._ls_status_label.setText(p.name)
+            self._ls_status_label.setStyleSheet("color: green;")
+        else:
+            self._ls_status_label.setText("路径无效或文件不存在")
+            self._ls_status_label.setStyleSheet("color: red;")
+
+    def _on_ls_browse(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择 Lossless Scaling 可执行文件", "",
+            "LosslessScaling.exe (LosslessScaling.exe);;可执行文件 (*.exe)",
+        )
+        if path:
+            self._settings.set("lossless_scaling_path", path)
+            self._ls_path_edit.setText(path)
+            self._update_ls_status(path)
+            self.lossless_scaling_changed.emit()
+
+    def _on_ls_hotkey_changed(self):
+        text = self._ls_hotkey_edit.text().strip().lower() or "ctrl+alt+s"
+        self._ls_hotkey_edit.setText(text)
+        self._settings.set("lossless_scaling_hotkey", text)
+        self.lossless_scaling_changed.emit()
