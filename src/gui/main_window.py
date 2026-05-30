@@ -25,7 +25,7 @@ from src.core.stream import (
 )
 from src.core.playlist import PlaylistManager, VideoItem, PlayMode, HistoryManager
 from src.core.bilibili_api import BilibiliAPI, BiliVideoInfo, BiliVideoItem
-from src.core.enhancer import Enhancer, EnhanceMode, Backend
+from src.core.enhancer import Enhancer, Backend
 from src.core.audio_pipe import AudioPipeline, PipelineState, PipelineStatus
 from src.core.sync import SyncManager, SyncState, SyncStatus
 from src.core.frame_gen import FrameGenManager
@@ -1692,13 +1692,16 @@ class MainWindow(QMainWindow):
 
     @Slot(dict)
     def _on_enhance_settings_changed(self, settings: dict):
-        """Handle enhance panel settings change — toggle enhanced audio on/off."""
-        if not settings["enabled"] and self._enhanced_playing:
+        """Handle enhance panel toggle change — turn enhanced audio off when both
+        models are deselected. Turning a model on does NOT auto-process; the user
+        must click '修复当前音频'. Re-enabling can resume already-rendered audio."""
+        any_enabled = settings["apollo_enabled"] or settings["flashsr_enabled"]
+        if not any_enabled and self._enhanced_playing:
             self._sync.deactivate_enhanced()
             self._enhanced_playing = False
             self._update_media_info()
             self._status_label.setText("已切换回原始音频")
-        elif settings["enabled"] and not self._enhanced_playing:
+        elif any_enabled and not self._enhanced_playing:
             status = self._pipeline.status
             if status.enhanced_file and status.state in (PipelineState.READY, PipelineState.ENHANCING):
                 current_pos = self._player_widget.position
@@ -1711,53 +1714,50 @@ class MainWindow(QMainWindow):
     def _init_enhance_backend(self):
         """Detect GPU backend and model availability in background thread.
 
-        All heavy imports (torch, audiosr) happen here off the main thread.
+        All heavy imports (torch) happen here off the main thread.
         Emits backend_ready when the panel has been updated.
         """
         def _worker():
             info = self._enhancer.device_info
-            fw_avail = self._enhancer.is_model_available(EnhanceMode.REALTIME)
-            asr_avail = self._enhancer.is_model_available(EnhanceMode.QUALITY)
+            avail = self._enhancer.available()
             self._enhance_status_update.emit(
-                ("backend_ready", info, fw_avail, asr_avail)
+                ("backend_ready", info, avail["apollo"], avail["flashsr"])
             )
 
         threading.Thread(target=_worker, daemon=True).start()
 
     @Slot()
     def _on_enhance_requested(self):
-        """User clicked 'enhance current audio'."""
+        """User clicked '修复当前音频'. Loads enabled models and runs the chain in
+        the background; original audio keeps playing until the result is ready."""
         if self._current_stream is None:
             QMessageBox.warning(self, "提示", "请先播放一个视频/音频")
             return
 
         settings = self._enhance_panel.get_settings()
-        mode = EnhanceMode.REALTIME if settings["mode"] == "realtime" else EnhanceMode.QUALITY
-        self._enhancer.set_target_sample_rate(settings["sample_rate"])
-        self._enhancer.set_num_steps(settings["nfe_steps"])
-        self._enhancer.set_ddim_steps(settings["ddim_steps"])
+        self._enhancer.set_apollo_enabled(settings["apollo_enabled"])
+        self._enhancer.set_flashsr_enabled(settings["flashsr_enabled"])
+        if not self._enhancer.any_enabled:
+            QMessageBox.warning(self, "提示", "请至少勾选一个增强模型 (Apollo / FlashSR)")
+            return
 
         # Load model in background, then start enhancement
         self._enhance_panel.show_progress(True)
         self._enhance_panel.update_progress(0.0, "正在加载模型...")
 
         def _load_and_enhance():
-            if not self._enhancer.load_model(mode):
+            if not self._enhancer.load_models():
                 self._enhance_status_update.emit(
                     PipelineStatus(state=PipelineState.ERROR,
                                    message="模型加载失败，请检查模型文件是否存在")
                 )
                 return
 
-            self._enhance_status_update.emit(("model_loaded", mode))
+            self._enhance_status_update.emit(("model_loaded", None))
 
             audio_url = self._current_stream.audio_url or self._current_stream.video_url
             headers = self._current_stream.http_headers
-
-            if mode == EnhanceMode.QUALITY:
-                self._pipeline.start_quality_enhance(audio_url, headers)
-            else:
-                self._pipeline.start_realtime_enhance(audio_url, headers)
+            self._pipeline.start_enhance(audio_url, headers)
 
         threading.Thread(target=_load_and_enhance, daemon=True).start()
 
@@ -1780,7 +1780,7 @@ class MainWindow(QMainWindow):
         if isinstance(status, tuple):
             msg_type = status[0]
             if msg_type == "backend_ready":
-                _, info, fw_avail, asr_avail = status
+                _, info, apollo_avail, flashsr_avail = status
                 backend_text = {
                     Backend.ROCM: f"ROCm ({info.device_name})",
                     Backend.DIRECTML: "DirectML",
@@ -1789,12 +1789,13 @@ class MainWindow(QMainWindow):
                 self._enhance_panel.set_backend_info(
                     backend_text, info.backend != Backend.CPU
                 )
-                if fw_avail or asr_avail:
+                self._enhance_panel.set_models_available(apollo_avail, flashsr_avail)
+                if apollo_avail or flashsr_avail:
                     parts = []
-                    if fw_avail:
-                        parts.append("FastWave")
-                    if asr_avail:
-                        parts.append("AudioSR")
+                    if apollo_avail:
+                        parts.append("Apollo")
+                    if flashsr_avail:
+                        parts.append("FlashSR")
                     self._enhance_panel.set_model_status(
                         f"可用: {', '.join(parts)}", True
                     )
@@ -1828,16 +1829,6 @@ class MainWindow(QMainWindow):
                 self._sync.activate_enhanced(status.enhanced_file, current_pos)
                 self._enhanced_playing = True
                 self._update_media_info()
-
-        elif status.state == PipelineState.ENHANCING and status.enhanced_file:
-            # Auto-switch: if enhanced audio covers current position + 10s buffer
-            if not self._enhanced_playing:
-                current_pos = self._player_widget.position
-                if self._enhanced_duration_s >= current_pos + 10.0:
-                    self._status_label.setText("增强覆盖当前位置 — 切换到升频音频")
-                    self._sync.activate_enhanced(status.enhanced_file, current_pos)
-                    self._enhanced_playing = True
-                    self._update_media_info()
 
         elif status.state == PipelineState.ERROR:
             self._enhance_panel.show_progress(False)

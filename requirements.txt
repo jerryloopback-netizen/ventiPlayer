@@ -3,11 +3,15 @@ python-mpv>=1.0
 yt-dlp>=2024.0
 numpy>=1.24
 
-# Phase 2: AI Audio Enhancement
+# Phase 2: AI Audio Enhancement (Apollo codec-repair + FlashSR super-resolution)
+# Both models are vendored under src/models/{apollo_src,flashsr_src}/ (not on PyPI).
+# Their inference paths are pure PyTorch — ROCm/DirectML friendly, no CUDA-only kernels.
 torch>=2.4
-audiosr>=0.0.7
 av>=12.0
 soundfile>=0.12
+scipy>=1.10        # polyphase resampling + FlashSR overlap-add
+librosa>=0.10      # audio I/O / mel utils used by the vendored model code
+einops>=0.7        # tensor ops in FlashSR / TorchJaekwon
 
 # Phase 7: Subtitle Generation
 transformers>=4.40

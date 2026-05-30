@@ -1,25 +1,22 @@
-"""Audio pipeline: decode stream → chunk → enhance → output.
+"""Audio pipeline: decode stream → enhance full track → output.
 
-Handles both real-time (FastWave streaming) and quality (AudioSR batch) modes.
-Uses PyAV for stream decoding and feeds enhanced audio back to mpv.
+Runs the enhancer's composable restoration chain (Apollo / FlashSR) on the whole
+track offline, preserving stereo, then writes a single WAV that mpv plays once the
+SyncManager switches to it. Original audio keeps playing until the result is ready.
 """
 
 import atexit
 import logging
 import tempfile
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from queue import Empty, Queue
 from typing import Callable, Optional
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
-
-CHUNK_DURATION_S = 5.0
-PREBUFFER_CHUNKS = 2
 
 _TEMP_PREFIX = "ventiplayer_"
 
@@ -59,16 +56,7 @@ class PipelineStatus:
 
 
 class AudioPipeline:
-    """Manages the audio decode → enhance → output flow.
-
-    Real-time mode (FastWave):
-        Decodes audio stream in chunks, enhances each chunk on GPU,
-        writes enhanced chunks to a temp file that mpv plays.
-
-    Quality mode (AudioSR):
-        Decodes full audio, runs AudioSR on the whole thing,
-        saves to temp file for mpv playback.
-    """
+    """Decode → enhance full track → write WAV. Offline (whole-track) only."""
 
     def __init__(self, enhancer):
         """
@@ -112,27 +100,14 @@ class AudioPipeline:
         if self._status_callback:
             self._status_callback(self.status)
 
-    def start_quality_enhance(self, audio_url: str, http_headers: dict = None):
-        """Start quality (AudioSR) enhancement in background thread."""
+    def start_enhance(self, audio_url: str, http_headers: dict = None):
+        """Start whole-track enhancement in a background thread."""
         self.cancel()
         self._cancel.clear()
         self._generation += 1
         gen = self._generation
         self._worker_thread = threading.Thread(
-            target=self._quality_worker,
-            args=(audio_url, http_headers, gen),
-            daemon=True,
-        )
-        self._worker_thread.start()
-
-    def start_realtime_enhance(self, audio_url: str, http_headers: dict = None):
-        """Start real-time (FastWave) enhancement in background thread."""
-        self.cancel()
-        self._cancel.clear()
-        self._generation += 1
-        gen = self._generation
-        self._worker_thread = threading.Thread(
-            target=self._realtime_worker,
+            target=self._worker,
             args=(audio_url, http_headers, gen),
             daemon=True,
         )
@@ -149,10 +124,10 @@ class AudioPipeline:
         self._update_status(state=PipelineState.IDLE, progress=0.0, message="")
 
     def _decode_full_audio(self, audio_url: str, http_headers: dict = None) -> tuple:
-        """Decode full audio stream to numpy array using PyAV.
+        """Decode full audio stream to numpy array using PyAV, preserving channels.
 
         Returns:
-            (audio_data: np.ndarray float32, sample_rate: int)
+            (audio_data: np.ndarray float32 shape (channels, samples), sample_rate: int)
         """
         import av
 
@@ -176,7 +151,7 @@ class AudioPipeline:
         audio_stream = container.streams.audio[0]
         sample_rate = audio_stream.rate
 
-        frames = []
+        frames = []  # each: (channels, samples)
         total_samples = 0
 
         for packet in container.demux(audio_stream):
@@ -185,23 +160,33 @@ class AudioPipeline:
                 return None, 0
 
             for frame in packet.decode():
-                arr = frame.to_ndarray(format='fltp')
-                if arr.ndim > 1:
-                    arr = arr.mean(axis=0)
+                arr = frame.to_ndarray(format='fltp')  # (channels, samples) for planar
+                if arr.ndim == 1:
+                    arr = arr[np.newaxis, :]
                 frames.append(arr.astype(np.float32))
-                total_samples += len(arr)
+                total_samples += arr.shape[-1]
 
         container.close()
 
         if not frames:
             return None, 0
 
-        audio_data = np.concatenate(frames)
-        self._update_status(progress=0.3, message=f"解码完成 ({total_samples} samples @ {sample_rate}Hz)")
+        # Some frames may have a different channel count on edge files; align to the
+        # max channel count by tiling mono up if needed.
+        nch = max(f.shape[0] for f in frames)
+        aligned = []
+        for f in frames:
+            if f.shape[0] < nch:
+                f = np.repeat(f, nch // f.shape[0], axis=0)[:nch]
+            aligned.append(f)
+        audio_data = np.concatenate(aligned, axis=1)  # (channels, total_samples)
+
+        self._update_status(progress=0.3,
+                            message=f"解码完成 ({total_samples} samples × {nch}ch @ {sample_rate}Hz)")
         return audio_data, sample_rate
 
-    def _quality_worker(self, audio_url: str, http_headers: dict = None, gen: int = 0):
-        """Worker thread for quality (AudioSR) mode."""
+    def _worker(self, audio_url: str, http_headers: dict = None, gen: int = 0):
+        """Worker thread: decode whole track → enhance chain → write WAV."""
         try:
             audio_data, sample_rate = self._decode_full_audio(audio_url, http_headers)
             if audio_data is None:
@@ -211,26 +196,30 @@ class AudioPipeline:
                 return
 
             self._update_status(state=PipelineState.ENHANCING, progress=0.3,
-                               message="AudioSR 增强中...")
+                               message="音频增强中...")
 
             def progress_cb(p):
                 if self._cancel.is_set():
                     raise InterruptedError("Enhancement cancelled")
-                overall = 0.3 + p * 0.6
+                overall = 0.3 + p * 0.65
                 self._update_status(progress=overall,
-                                   message=f"AudioSR 增强中... {int(p * 100)}%")
+                                   message=f"音频增强中... {int(p * 100)}%")
 
-            enhanced = self._enhancer.enhance_full(audio_data, sample_rate,
-                                                   progress_callback=progress_cb)
+            enhanced, output_sr = self._enhancer.enhance_full(
+                audio_data, sample_rate, progress_callback=progress_cb)
 
             if self._cancel.is_set() or gen != self._generation:
                 return
-            import soundfile as sf
-            output_sr = self._enhancer._target_sr
-            output_path = Path(self._temp_dir) / "enhanced_quality.wav"
-            sf.write(str(output_path), enhanced, output_sr, subtype="FLOAT")
 
-            enhanced_duration_s = len(enhanced) / output_sr
+            import soundfile as sf
+            # enhanced: (channels, samples) → soundfile wants (samples, channels)
+            if enhanced.ndim == 1:
+                enhanced = enhanced[np.newaxis, :]
+            channels = enhanced.shape[0]
+            output_path = Path(self._temp_dir) / "enhanced_quality.wav"
+            sf.write(str(output_path), enhanced.T, output_sr, subtype="FLOAT")
+
+            enhanced_duration_s = enhanced.shape[-1] / output_sr
             self._update_status(
                 state=PipelineState.READY,
                 progress=1.0,
@@ -240,141 +229,21 @@ class AudioPipeline:
             )
 
         except InterruptedError:
-            logger.info("Quality enhancement cancelled by user")
+            logger.info("Enhancement cancelled by user")
             return
+        except RuntimeError as e:
+            if self._cancel.is_set():
+                return
+            msg = str(e)
+            recoverable = "VRAM" in msg or "out of memory" in msg.lower() or True
+            logger.error(f"Enhancement failed: {e}")
+            self._update_status(state=PipelineState.ERROR,
+                               message=f"增强失败: {e}",
+                               recoverable=recoverable)
         except Exception as e:
             if self._cancel.is_set():
                 return
-            logger.error(f"Quality enhancement failed: {e}")
-            self._update_status(state=PipelineState.ERROR,
-                               message=f"增强失败: {e}",
-                               recoverable=True)
-
-    def _realtime_worker(self, audio_url: str, http_headers: dict = None, gen: int = 0):
-        """Worker thread for real-time (FastWave) mode."""
-        try:
-            import av
-            import soundfile as sf
-
-            self._update_status(state=PipelineState.DECODING, progress=0.0,
-                               message="正在解码并增强...")
-
-            options = {}
-            if http_headers:
-                full_headers = dict(http_headers)
-                if "User-Agent" not in full_headers:
-                    full_headers["User-Agent"] = (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/120.0.0.0 Safari/537.36"
-                    )
-                options["user_agent"] = full_headers["User-Agent"]
-                if "Referer" in full_headers:
-                    options["referer"] = full_headers["Referer"]
-
-            container = av.open(audio_url, options=options)
-            audio_stream = container.streams.audio[0]
-            sample_rate = audio_stream.rate
-            chunk_samples = int(CHUNK_DURATION_S * sample_rate)
-
-            duration = float(audio_stream.duration * audio_stream.time_base) if audio_stream.duration else 0
-            total_chunks_est = max(1, int(duration / CHUNK_DURATION_S)) if duration > 0 else 50
-
-            buffer = np.zeros(0, dtype=np.float32)
-            chunk_count = 0
-            total_written_samples = 0
-            output_sr = self._enhancer._target_sr
-            output_path = Path(self._temp_dir) / "enhanced_realtime.wav"
-
-            # Open WAV file in write mode, then append subsequent chunks
-            out_file = sf.SoundFile(
-                str(output_path), mode='w', samplerate=output_sr,
-                channels=1, subtype="FLOAT",
-            )
-
-            self._update_status(state=PipelineState.ENHANCING, progress=0.0,
-                               message="实时增强中...")
-
-            for packet in container.demux(audio_stream):
-                if self._cancel.is_set() or gen != self._generation:
-                    break
-
-                for frame in packet.decode():
-                    arr = frame.to_ndarray(format='fltp')
-                    if arr.ndim > 1:
-                        arr = arr.mean(axis=0)
-                    buffer = np.concatenate([buffer, arr.astype(np.float32)])
-
-                    while len(buffer) >= chunk_samples:
-                        chunk = buffer[:chunk_samples]
-                        buffer = buffer[chunk_samples:]
-
-                        try:
-                            enhanced = self._enhancer.enhance_chunk(chunk, sample_rate)
-                        except RuntimeError as e:
-                            if "VRAM" in str(e) or "out of memory" in str(e).lower():
-                                out_file.close()
-                                container.close()
-                                self._update_status(
-                                    state=PipelineState.ERROR,
-                                    message=f"显存不足，增强中止: {e}",
-                                    recoverable=True,
-                                )
-                                return
-                            raise
-                        out_file.write(enhanced)
-                        out_file.flush()
-                        chunk_count += 1
-                        total_written_samples += len(enhanced)
-                        enhanced_dur = total_written_samples / output_sr
-
-                        progress = min(0.95, chunk_count / total_chunks_est)
-                        self._update_status(
-                            progress=progress,
-                            message=f"已增强 {chunk_count}/{total_chunks_est} 个分块",
-                            enhanced_file=str(output_path),
-                            enhanced_duration_s=enhanced_dur,
-                        )
-
-            # Process remaining buffer
-            if len(buffer) > 0 and not self._cancel.is_set() and gen == self._generation:
-                try:
-                    enhanced = self._enhancer.enhance_chunk(buffer, sample_rate)
-                except RuntimeError as e:
-                    if "VRAM" in str(e) or "out of memory" in str(e).lower():
-                        out_file.close()
-                        self._update_status(
-                            state=PipelineState.ERROR,
-                            message=f"显存不足，增强中止: {e}",
-                            recoverable=True,
-                        )
-                        return
-                    raise
-                out_file.write(enhanced)
-                total_written_samples += len(enhanced)
-
-            out_file.close()
-            container.close()
-
-            if self._cancel.is_set() or gen != self._generation:
-                return
-
-            if total_written_samples == 0:
-                self._update_status(state=PipelineState.ERROR, message="无音频数据")
-                return
-
-            enhanced_dur = total_written_samples / output_sr
-
-            self._update_status(
-                state=PipelineState.READY,
-                progress=1.0,
-                message="增强完成",
-                enhanced_file=str(output_path),
-                enhanced_duration_s=enhanced_dur,
-            )
-
-        except Exception as e:
-            logger.error(f"Realtime enhancement failed: {e}")
+            logger.error(f"Enhancement failed: {e}")
             self._update_status(state=PipelineState.ERROR,
                                message=f"增强失败: {e}",
                                recoverable=True)

@@ -1,115 +1,70 @@
-"""Download AudioSR and FastWave dependencies to local cache.
+"""Download Apollo and FlashSR model weights to local cache.
 
 Run this script once to pre-download all model files needed.
-After this, models can run in offline mode.
+After this, models can run offline.
+
+Targets:
+  ~/.ventiplayer/models/apollo/
+      apollo_model_uni.ckpt   (~70 MB)  Universal lossy enhancer (codec repair)
+      config_apollo_uni.yaml            (also bundled in repo; copied here as backup)
+  ~/.ventiplayer/models/flashsr/
+      student_ldm.pth         (986 MB)  Distilled latent diffusion model
+      sr_vocoder.pth          (599 MB)  Super-resolution vocoder
+      vae.pth                 (1.6 GB)  Variational autoencoder
 """
 import os
-import sys
-import json
-import hashlib
 from pathlib import Path
-from urllib.request import urlretrieve, Request, urlopen
+from urllib.request import urlretrieve
 
-HF_CACHE = Path.home() / ".cache" / "huggingface" / "hub"
 MODELS_DIR = Path.home() / ".ventiplayer" / "models"
-MIRROR = "https://hf-mirror.com"
+APOLLO_DIR = MODELS_DIR / "apollo"
+FLASHSR_DIR = MODELS_DIR / "flashsr"
 
-FASTWAVE_DIR = MODELS_DIR / "fastwave"
-FASTWAVE_GDRIVE_ID = "1oNCxrKjgiWsYGW6P49rsI84vFYR5G3m8"
+# Apollo "Universal Lossy Enhancer" — GitHub release assets (deton24 fork)
+APOLLO_BASE = ("https://github.com/deton24/"
+               "Lew-s-vocal-enhancer-for-Apollo-by-JusperLee/releases/download/uni")
+APOLLO_FILES = {
+    "apollo_model_uni.ckpt": f"{APOLLO_BASE}/apollo_model_uni.ckpt",
+    "config_apollo_uni.yaml": f"{APOLLO_BASE}/config_apollo_uni.yaml",
+}
 
-
-def download_file(repo_id: str, filename: str):
-    """Download a file from hf-mirror and place it in the HF cache structure."""
-    # HF cache structure: models--{org}--{name}/snapshots/{commit_hash}/{filename}
-    repo_dir = HF_CACHE / f"models--{repo_id.replace('/', '--')}"
-    refs_dir = repo_dir / "refs"
-    snapshots_dir = repo_dir / "snapshots"
-    blobs_dir = repo_dir / "blobs"
-
-    refs_dir.mkdir(parents=True, exist_ok=True)
-    snapshots_dir.mkdir(parents=True, exist_ok=True)
-    blobs_dir.mkdir(parents=True, exist_ok=True)
-
-    # Use a fixed fake commit hash
-    commit_hash = "0000000000000000000000000000000000000001"
-    snapshot_dir = snapshots_dir / commit_hash
-    snapshot_dir.mkdir(exist_ok=True)
-
-    # Write refs/main
-    (refs_dir / "main").write_text(commit_hash)
-
-    target_path = snapshot_dir / filename
-    if target_path.exists():
-        print(f"  Already exists: {filename}")
-        return target_path
-
-    url = f"{MIRROR}/{repo_id}/resolve/main/{filename}"
-    print(f"  Downloading: {url}")
-    urlretrieve(url, str(target_path))
-    print(f"  Saved: {target_path} ({target_path.stat().st_size / 1024:.0f} KB)")
-    return target_path
+# FlashSR weights — HuggingFace dataset (via hf-mirror for CN access)
+HF_MIRROR = os.environ.get("HF_ENDPOINT", "https://hf-mirror.com")
+FLASHSR_REPO = "datasets/jakeoneijk/FlashSR_weights"
+FLASHSR_FILES = ["student_ldm.pth", "sr_vocoder.pth", "vae.pth"]
 
 
-def download_gdrive(file_id: str, dest: Path):
-    """Download a file from Google Drive (handles confirm token for large files)."""
-    if dest.exists():
-        print(f"  Already exists: {dest.name}")
+def _download(url: str, dest: Path):
+    if dest.exists() and dest.stat().st_size > 0:
+        print(f"  Already exists: {dest.name} ({dest.stat().st_size / 1024 / 1024:.1f} MB)")
         return
     dest.parent.mkdir(parents=True, exist_ok=True)
-
-    base_url = "https://drive.google.com/uc?export=download"
-    session_url = f"{base_url}&id={file_id}"
-
-    print(f"  Downloading from Google Drive (id={file_id})...")
+    print(f"  Downloading: {url}")
     try:
-        import gdown
-        gdown.download(id=file_id, output=str(dest), quiet=False)
-    except ImportError:
-        print("  [WARNING] gdown not installed. Install with: pip install gdown")
-        print(f"  Manual download: https://drive.google.com/file/d/{file_id}/view")
-        print(f"  Place the file at: {dest}")
-        return
-
-    if dest.exists():
+        urlretrieve(url, str(dest))
         print(f"  Saved: {dest} ({dest.stat().st_size / 1024 / 1024:.1f} MB)")
-    else:
-        print(f"  [ERROR] Download failed. Please download manually.")
+    except Exception as e:
+        print(f"  [ERROR] Download failed: {e}")
+        print(f"  Manual download: {url}\n  Place at: {dest}")
 
 
 def main():
-    print("=== Downloading model files ===\n")
+    print("=== Downloading audio enhancement model files ===\n")
 
-    # 1. FastWave checkpoint
-    print("--- FastWave ---")
-    fw_ckpt = FASTWAVE_DIR / "checkpoint.pth"
-    download_gdrive(FASTWAVE_GDRIVE_ID, fw_ckpt)
+    print("--- Apollo (codec repair) ---")
+    for fname, url in APOLLO_FILES.items():
+        _download(url, APOLLO_DIR / fname)
 
-    # 2. AudioSR checkpoint
-    print("\n--- AudioSR ---")
-    audiosr_repo = HF_CACHE / "models--haoheliu--audiosr_basic"
-    audiosr_snapshots = audiosr_repo / "snapshots"
-    audiosr_found = False
-    if audiosr_snapshots.exists():
-        for snap in audiosr_snapshots.iterdir():
-            if (snap / "pytorch_model.bin").exists():
-                audiosr_found = True
-                print(f"[OK] AudioSR checkpoint: {(snap / 'pytorch_model.bin').stat().st_size / 1024 / 1024:.0f} MB")
-                break
-    if not audiosr_found:
-        print("[DOWNLOADING] AudioSR checkpoint...")
-        download_file("haoheliu/audiosr_basic", "pytorch_model.bin")
+    print("\n--- FlashSR (sample-rate super-resolution) ---")
+    print("  (large: ~3.2 GB total)")
+    for fname in FLASHSR_FILES:
+        url = f"{HF_MIRROR}/{FLASHSR_REPO}/resolve/main/{fname}"
+        _download(url, FLASHSR_DIR / fname)
 
-    # 3. RoBERTa-base (needed by CLAP tokenizer)
-    print("\n--- roberta-base ---")
-    roberta_files = [
-        "config.json", "tokenizer.json", "vocab.json",
-        "merges.txt", "tokenizer_config.json", "special_tokens_map.json",
-    ]
-    for f in roberta_files:
-        download_file("roberta-base", f)
-
-    print("\n=== All downloads complete ===")
+    print("\n=== Done ===")
     print("Models can now run offline.")
+    print("Note: the FlashSR model code is vendored in src/models/flashsr_src/,")
+    print("      and Apollo's config is also bundled in src/models/apollo_src/configs/.")
 
 
 if __name__ == "__main__":

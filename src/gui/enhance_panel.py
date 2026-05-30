@@ -1,7 +1,7 @@
 from PySide6.QtWidgets import (
     QWidget, QGroupBox, QVBoxLayout, QHBoxLayout,
-    QCheckBox, QRadioButton, QComboBox, QLabel, QButtonGroup,
-    QProgressBar, QPushButton, QSlider,
+    QCheckBox, QLabel,
+    QProgressBar, QPushButton,
 )
 from PySide6.QtCore import Signal, Qt
 from PySide6.QtGui import QPainter, QColor
@@ -34,7 +34,13 @@ class PlaybackMarkerProgressBar(QProgressBar):
 
 
 class EnhancePanel(QWidget):
-    """Audio enhancement control panel."""
+    """Audio enhancement control panel.
+
+    Two independent toggles (Apollo codec repair / FlashSR super-resolution).
+    Either or both can be enabled; both → chained Apollo → FlashSR.
+    The "修复当前音频" button kicks off background processing; original audio
+    keeps playing until the repaired track is ready.
+    """
 
     settings_changed = Signal(dict)
     enhance_requested = Signal()
@@ -42,9 +48,10 @@ class EnhancePanel(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._blocked = False
-        self._stream_ready = False  # True after a stream has been resolved
-        self._model_loaded = False  # True after model is confirmed available
+        self._stream_ready = False     # True after a stream has been resolved
+        self._apollo_available = False  # weights present
+        self._flashsr_available = False
+        self._high_sr = False          # source SR >= 48kHz → FlashSR pointless
         self._setup_ui()
 
     def _setup_ui(self):
@@ -54,74 +61,20 @@ class EnhancePanel(QWidget):
         group = QGroupBox("音频增强")
         group_layout = QVBoxLayout(group)
 
-        self._enable_check = QCheckBox("启用带宽截止修复+采样率超分")
-        self._enable_check.stateChanged.connect(self._on_settings_changed)
-        group_layout.addWidget(self._enable_check)
+        hint = QLabel("修复流媒体压缩损伤。可单独或同时启用；两者同开时先 Apollo 修复再 FlashSR 超分。")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #888; font-size: 11px;")
+        group_layout.addWidget(hint)
 
-        mode_layout = QHBoxLayout()
-        mode_layout.addWidget(QLabel("模式:"))
-        self._mode_group = QButtonGroup(self)
-        self._realtime_radio = QRadioButton("快速 (FastWave)")
-        self._quality_radio = QRadioButton("精听 (AudioSR)")
-        self._realtime_radio.setChecked(True)
-        self._mode_group.addButton(self._realtime_radio)
-        self._mode_group.addButton(self._quality_radio)
-        self._realtime_radio.toggled.connect(self._on_settings_changed)
-        mode_layout.addWidget(self._realtime_radio)
-        mode_layout.addWidget(self._quality_radio)
-        mode_layout.addStretch()
-        group_layout.addLayout(mode_layout)
+        # Apollo toggle
+        self._apollo_check = QCheckBox("编解码修复 (Apollo) — 修复高频损失/压缩伪影，保持源采样率")
+        self._apollo_check.stateChanged.connect(self._on_settings_changed)
+        group_layout.addWidget(self._apollo_check)
 
-        sr_layout = QHBoxLayout()
-        sr_layout.addWidget(QLabel("输出采样率:"))
-        self._sr_combo = QComboBox()
-        self._sr_combo.addItems([
-            "44100 Hz (重采样)",
-            "48000 Hz (native)",
-            "96000 Hz (仅插值)",
-            "192000 Hz (仅插值)",
-        ])
-        self._sr_combo.setCurrentIndex(1)
-        self._sr_combo.currentIndexChanged.connect(self._on_settings_changed)
-        sr_layout.addWidget(self._sr_combo)
-        sr_layout.addStretch()
-        group_layout.addLayout(sr_layout)
-
-        # NFE steps slider (FastWave only)
-        self._nfe_widget = QWidget()
-        nfe_layout = QHBoxLayout(self._nfe_widget)
-        nfe_layout.setContentsMargins(0, 0, 0, 0)
-        nfe_layout.addWidget(QLabel("采样步数:"))
-        self._nfe_slider = QSlider(Qt.Orientation.Horizontal)
-        self._nfe_slider.setRange(2, 16)
-        self._nfe_slider.setValue(4)
-        self._nfe_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
-        self._nfe_slider.setTickInterval(2)
-        self._nfe_slider.valueChanged.connect(self._on_nfe_changed)
-        self._nfe_label = QLabel("4 步")
-        self._nfe_label.setFixedWidth(36)
-        nfe_layout.addWidget(self._nfe_slider)
-        nfe_layout.addWidget(self._nfe_label)
-        group_layout.addWidget(self._nfe_widget)
-
-        # DDIM steps slider (AudioSR only)
-        self._ddim_widget = QWidget()
-        ddim_layout = QHBoxLayout(self._ddim_widget)
-        ddim_layout.setContentsMargins(0, 0, 0, 0)
-        ddim_layout.addWidget(QLabel("DDIM 步数:"))
-        self._ddim_slider = QSlider(Qt.Orientation.Horizontal)
-        self._ddim_slider.setRange(10, 100)
-        self._ddim_slider.setValue(50)
-        self._ddim_slider.setSingleStep(10)
-        self._ddim_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
-        self._ddim_slider.setTickInterval(10)
-        self._ddim_slider.valueChanged.connect(self._on_ddim_changed)
-        self._ddim_label = QLabel("50 步")
-        self._ddim_label.setFixedWidth(36)
-        ddim_layout.addWidget(self._ddim_slider)
-        ddim_layout.addWidget(self._ddim_label)
-        group_layout.addWidget(self._ddim_widget)
-        self._ddim_widget.hide()
+        # FlashSR toggle
+        self._flashsr_check = QCheckBox("采样率超分 (FlashSR) — 重建高频并升频到 48kHz")
+        self._flashsr_check.stateChanged.connect(self._on_settings_changed)
+        group_layout.addWidget(self._flashsr_check)
 
         # Backend status
         backend_layout = QHBoxLayout()
@@ -160,7 +113,7 @@ class EnhancePanel(QWidget):
 
         # Action buttons
         btn_layout = QHBoxLayout()
-        self._enhance_btn = QPushButton("增强当前音频")
+        self._enhance_btn = QPushButton("修复当前音频")
         self._enhance_btn.clicked.connect(self.enhance_requested.emit)
         self._enhance_btn.setEnabled(False)
         btn_layout.addWidget(self._enhance_btn)
@@ -174,30 +127,14 @@ class EnhancePanel(QWidget):
 
         layout.addWidget(group)
 
-    def _on_nfe_changed(self, value):
-        self._nfe_label.setText(f"{value} 步")
-        self._on_settings_changed()
-
-    def _on_ddim_changed(self, value):
-        self._ddim_label.setText(f"{value} 步")
-        self._on_settings_changed()
-
     def _on_settings_changed(self):
-        # Toggle slider visibility based on mode
-        is_realtime = self._realtime_radio.isChecked()
-        self._nfe_widget.setVisible(is_realtime)
-        self._ddim_widget.setVisible(not is_realtime)
         self._update_enhance_btn_state()
         self.settings_changed.emit(self.get_settings())
 
     def get_settings(self) -> dict:
-        sr_text = self._sr_combo.currentText().split()[0]
         return {
-            "enabled": self._enable_check.isChecked(),
-            "mode": "realtime" if self._realtime_radio.isChecked() else "quality",
-            "sample_rate": int(sr_text),
-            "nfe_steps": self._nfe_slider.value(),
-            "ddim_steps": self._ddim_slider.value(),
+            "apollo_enabled": self._apollo_check.isChecked(),
+            "flashsr_enabled": self._flashsr_check.isChecked(),
         }
 
     def set_backend_info(self, text: str, available: bool):
@@ -211,46 +148,59 @@ class EnhancePanel(QWidget):
         self._model_label.setStyleSheet(
             "color: green;" if loaded else "color: gray;"
         )
-        self._model_loaded = loaded
-        self._update_enhance_btn_state()
+
+    def set_models_available(self, apollo: bool, flashsr: bool):
+        """Gate each checkbox by whether its weights are present."""
+        self._apollo_available = apollo
+        self._flashsr_available = flashsr
+        self._refresh_checkbox_state()
 
     def set_enhance_enabled(self, enabled: bool):
         self._stream_ready = enabled
         self._update_enhance_btn_state()
 
-    def _update_enhance_btn_state(self):
-        """Recalculate whether the enhance button should be enabled."""
-        self._enhance_btn.setEnabled(
-            self._stream_ready
-            and self._model_loaded
-            and self._enable_check.isChecked()
-            and not self._blocked
-        )
-
     def set_enhance_blocked(self, blocked: bool):
-        """Block enhancement when source audio >= 48kHz."""
-        self._blocked = blocked
-        self._enable_check.setEnabled(not blocked)
-        if blocked:
-            self._enable_check.setChecked(False)
-            self._enable_check.setText(
-                "启用带宽截止修复+采样率超分 (原始采样率≥模型原生输出)"
-            )
-        else:
-            self._enable_check.setText("启用带宽截止修复+采样率超分")
+        """Source SR >= 48kHz: FlashSR has nothing to super-resolve, so disable
+        it. Apollo (artifact repair) still applies, so it stays available."""
+        self._high_sr = blocked
+        self._refresh_checkbox_state()
+
+    def _refresh_checkbox_state(self):
+        # Apollo: enabled iff weights present
+        apollo_ok = self._apollo_available
+        self._apollo_check.setEnabled(apollo_ok)
+        if not apollo_ok and self._apollo_check.isChecked():
+            self._apollo_check.setChecked(False)
+
+        # FlashSR: enabled iff weights present AND source SR not already high
+        flashsr_ok = self._flashsr_available and not self._high_sr
+        self._flashsr_check.setEnabled(flashsr_ok)
+        if not flashsr_ok and self._flashsr_check.isChecked():
+            self._flashsr_check.setChecked(False)
+
+        suffix = " (源采样率已达 48kHz)" if self._high_sr else ""
+        self._flashsr_check.setText(
+            "采样率超分 (FlashSR) — 重建高频并升频到 48kHz" + suffix
+        )
         self._update_enhance_btn_state()
 
+    def _update_enhance_btn_state(self):
+        """Enable run button only when a stream is ready and >=1 model selected."""
+        any_selected = (
+            (self._apollo_check.isChecked() and self._apollo_check.isEnabled())
+            or (self._flashsr_check.isChecked() and self._flashsr_check.isEnabled())
+        )
+        self._enhance_btn.setEnabled(self._stream_ready and any_selected)
+
     def show_progress(self, visible: bool):
-        is_quality = self._quality_radio.isChecked()
-        # In AudioSR mode: hide progress bar, only show status text
-        self._progress.setVisible(visible and not is_quality)
+        self._progress.setVisible(visible)
         self._status_label.setVisible(visible)
         self._cancel_btn.setVisible(visible)
         self._cancel_btn.setEnabled(visible)
         if visible:
-            self._enhance_btn.setText("重新增强")
+            self._enhance_btn.setText("重新修复")
         else:
-            self._enhance_btn.setText("增强当前音频")
+            self._enhance_btn.setText("修复当前音频")
             self._progress.setValue(0)
             self._progress.set_playback_ratio(-1.0)
             self._status_label.setText("")

@@ -5,9 +5,8 @@ from pathlib import Path
 DEFAULT_CONFIG = {
     "audio_exclusive": True,
     "audio_device": "auto",
-    "enhance_enabled": False,
-    "enhance_mode": "realtime",  # "realtime" or "quality"
-    "output_sample_rate": 48000,
+    "apollo_enabled": False,    # Apollo codec-artifact repair (44.1kHz)
+    "flashsr_enabled": False,   # FlashSR sample-rate super-resolution (48kHz)
     "cookie_file": "",
     "cookie_browser": "edge",  # e.g. "chrome", "firefox", "edge"
     "volume": 100,
